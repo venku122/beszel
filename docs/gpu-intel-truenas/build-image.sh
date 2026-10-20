@@ -8,8 +8,8 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
 fi
 source_sha=$(git rev-parse HEAD)
 commit=$(printf '%.12s' "$source_sha")
-# Digest pins the compiler image. Update it deliberately when go.mod changes.
-go_image='golang:1.27.2@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8'
+# Platform-specific digest pins the linux/amd64 compiler image. Update it deliberately when go.mod changes.
+go_image='golang:1.27.2@sha256:2d658507a011f1eadc0114d7a421b312b2e77d9042a24036a26e267cc9231677'
 go_version=$(git show "$source_sha:go.mod" | awk '$1 == "go" {print $2; exit}')
 case "$go_version" in
     1.27.2) ;;
