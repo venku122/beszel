@@ -58,7 +58,8 @@ type GPUManager struct {
 	intelSysfsPackageCounts map[string]uint32
 	intelSysfsPackageValid  map[string]bool
 	collectorCancel         context.CancelFunc
-	collectorWG             sync.WaitGroup
+	collectorDone           chan struct{}
+	collectorStopped        bool
 }
 
 // gpuSnapshot stores the last observed incremental values for delta tracking
@@ -845,13 +846,24 @@ func NewGPUManager() (*GPUManager, error) {
 	return &gm, nil
 }
 
-// stopCollectors cancels and joins background collectors that support shutdown.
+// stopCollectors bounds shutdown even if a kernel sysfs operation never returns.
+// Keep the single worker marked stopped; never spawn replacement blocked readers.
 func (gm *GPUManager) stopCollectors() {
 	gm.Lock()
-	cancel := gm.collectorCancel
+	gm.collectorStopped = true
+	cancel, done := gm.collectorCancel, gm.collectorDone
 	gm.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	gm.collectorWG.Wait()
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.Warn("GPU collector shutdown timed out; kernel sensor read may be blocked")
+	}
 }

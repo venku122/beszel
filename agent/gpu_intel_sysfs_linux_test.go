@@ -15,6 +15,7 @@ import (
 	"github.com/henrygd/beszel/internal/entities/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func setupIntelSysfsTest(t *testing.T) (root, cardPath, hwmonPath string) {
@@ -480,4 +481,63 @@ func TestIntelSysfsOversizedNumericPrefixRejected(t *testing.T) {
 	require.Error(t, err)
 	_, err = readSysfsUint(path)
 	require.Error(t, err)
+}
+
+// A FIFO deterministically holds an optional kernel-style sensor read open.
+// Writer rendezvous proves the collector reached open/read, without sleep guesses.
+func blockedIntelCollector(t *testing.T) (*GPUManager, func()) {
+	t.Helper()
+	_, card, hwmon := setupIntelSysfsTest(t)
+	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	fifo := filepath.Join(hwmon, "temp1_input")
+	require.NoError(t, unix.Mkfifo(fifo, 0600))
+	gm := &GPUManager{GpuDataMap: map[string]*system.GPUData{"amd-card1": {Name: "AMD", Temperature: 50, Count: 1}}}
+	require.True(t, gm.startIntelSysfsCollector())
+	fd := -1
+	require.Eventually(t, func() bool {
+		var err error
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		return err == nil
+	}, time.Second, time.Millisecond)
+	release := sync.OnceFunc(func() { require.NoError(t, unix.Close(fd)) })
+	t.Cleanup(func() {
+		release()
+		gm.stopCollectors()
+		select {
+		case <-gm.collectorDone:
+		case <-time.After(time.Second):
+			t.Error("released FIFO worker did not exit")
+		}
+	})
+	return gm, release
+}
+func TestIntelSysfsBlockedReadDoesNotFreezeHub(t *testing.T) {
+	gm, _ := blockedIntelCollector(t)
+	done := make(chan map[string]system.GPUData, 1)
+	go func() { done <- gm.GetCurrentData(1) }()
+	select {
+	case data := <-done:
+		require.Contains(t, data, "amd-card1")
+	case <-time.After(200 * time.Millisecond):
+		t.Error("blocked Intel sensor freezes hub GPU collection")
+	}
+}
+func TestIntelSysfsBlockedReadDoesNotFreezeShutdown(t *testing.T) {
+	gm, release := blockedIntelCollector(t)
+	done := make(chan struct{})
+	go func() { gm.stopCollectors(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("shutdown waits indefinitely for kernel-stalled Intel read")
+	}
+	release()
+	select {
+	case <-gm.collectorDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after read released")
+	}
+	require.False(t, gm.startIntelSysfsCollector(), "stopped manager must not create replacement blocked workers")
+	require.NotContains(t, gm.GetCurrentData(1), "card0", "late read committed after cancellation")
 }

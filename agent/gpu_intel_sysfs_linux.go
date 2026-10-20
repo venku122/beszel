@@ -43,14 +43,17 @@ func (gm *GPUManager) hasIntelSysfs() bool {
 func (gm *GPUManager) startIntelSysfsCollector() bool {
 	gm.Lock()
 	defer gm.Unlock()
+	if gm.collectorStopped {
+		return false
+	}
 	if gm.collectorCancel != nil {
 		return true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	gm.collectorCancel = cancel
-	gm.collectorWG.Add(1)
+	gm.collectorDone = make(chan struct{})
 	go func() {
-		defer gm.collectorWG.Done()
+		defer close(gm.collectorDone)
 		gm.collectIntelSysfsStatsContext(ctx)
 	}()
 	return true
@@ -90,8 +93,9 @@ func (gm *GPUManager) pollIntelSysfs() bool {
 	seen := make(map[string]bool, len(cards))
 	hasData := false
 	for _, card := range cards {
+		device := intelSysfsDevice(card.cardPath)
 		gm.Lock()
-		id := gm.intelSysfsID(card.cardPath)
+		id := gm.intelSysfsID(card.cardPath, device)
 		gm.Unlock()
 		if id == "" {
 			continue
@@ -179,19 +183,45 @@ func sysfsFileExists(path string) bool {
 // updateIntelSysfsGpuData reads GPU metrics from sysfs and updates the GPU data map.
 // Returns true if the required energy counter was read successfully.
 func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
+	// All filesystem operations, including metadata and optional sensors, occur
+	// outside the manager lock. A kernel-stalled read must not freeze hub stats.
+	started := time.Now()
 	devicePath := filepath.Join(cardPath, "device")
+	device := intelSysfsDevice(cardPath)
+	sensorPath, sensorErr := filepath.EvalSymlinks(hwmonDir)
+	if sensorErr != nil {
+		sensorPath = hwmonDir
+	}
+	name := getIntelSysfsGpuName(cardPath)
+	energy, energyErr := readSysfsUint(filepath.Join(hwmonDir, "energy1_input"))
+	now := intelSysfsNow()
+	pkgPath, pkgEnergy, pkgErr := readIntelSysfsPackageCounter(hwmonDir)
+	temp := readIntelSysfsTemperature(hwmonDir)
+	usage, usageErr := readOptionalSysfsFloat(filepath.Join(devicePath, "gpu_busy_percent"))
+	memUsed, memUsedErr := readFirstOptionalSysfsFloat(
+		filepath.Join(devicePath, "mem_info_vram_used"), filepath.Join(devicePath, "mem_info_lmem_used"), filepath.Join(devicePath, "mem_info_local_mem_used"))
+	memTotal, memTotalErr := readFirstOptionalSysfsFloat(
+		filepath.Join(devicePath, "mem_info_vram_total"), filepath.Join(devicePath, "mem_info_lmem_total"), filepath.Join(devicePath, "mem_info_local_mem_total"))
+	// Reject a path reassigned during sampling. Revalidation also stays outside
+	// the mutex, and stopped collectors can never commit late sensor results.
+	if device != intelSysfsDevice(cardPath) {
+		return false
+	}
+	afterSensor, err := filepath.EvalSymlinks(hwmonDir)
+	if err == nil && afterSensor != sensorPath {
+		return false
+	}
 	gm.Lock()
 	defer gm.Unlock()
-	id := gm.intelSysfsID(cardPath)
+	if gm.collectorStopped || time.Since(started) > 10*time.Second {
+		return false
+	}
+	id := gm.intelSysfsID(cardPath, device)
 	if id == "" {
 		return false
 	}
 	if gm.intelSysfsSensorPaths == nil {
 		gm.intelSysfsSensorPaths = make(map[string]string)
-	}
-	sensorPath, err := filepath.EvalSymlinks(hwmonDir)
-	if err != nil {
-		sensorPath = hwmonDir
 	}
 	if gm.intelSysfsSensorPaths[id] != sensorPath {
 		delete(gm.intelSysfsEnergySnapshots, id)
@@ -210,8 +240,7 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	gm.intelSysfsSamples[id] = time.Time{}
 	gm.intelSysfsPackageValid[id] = false
 
-	energy, err := readSysfsUint(filepath.Join(hwmonDir, "energy1_input"))
-	if err != nil {
+	if energyErr != nil {
 		delete(gm.intelSysfsEnergySnapshots, id)
 		// No interval may bridge an unreadable counter.
 		for key := range gm.intelSysfsEnergySnapshots {
@@ -222,25 +251,12 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 		return false
 	}
 
-	now := intelSysfsNow()
 	power, hasPower := gm.calculateIntelSysfsPower(id, energy, now)
-	powerPkg, hasPowerPkg := gm.readIntelSysfsPowerPkg(id, hwmonDir, now)
-	temp := readIntelSysfsTemperature(hwmonDir)
-	usage, usageErr := readOptionalSysfsFloat(filepath.Join(devicePath, "gpu_busy_percent"))
-	memUsed, memUsedErr := readFirstOptionalSysfsFloat(
-		filepath.Join(devicePath, "mem_info_vram_used"),
-		filepath.Join(devicePath, "mem_info_lmem_used"),
-		filepath.Join(devicePath, "mem_info_local_mem_used"),
-	)
-	memTotal, memTotalErr := readFirstOptionalSysfsFloat(
-		filepath.Join(devicePath, "mem_info_vram_total"),
-		filepath.Join(devicePath, "mem_info_lmem_total"),
-		filepath.Join(devicePath, "mem_info_local_mem_total"),
-	)
+	powerPkg, hasPowerPkg := gm.calculateIntelSysfsPackagePower(id, pkgPath, pkgEnergy, pkgErr, now)
 
 	gpu, ok := gm.GpuDataMap[id]
 	if !ok {
-		gpu = &system.GPUData{Name: getIntelSysfsGpuName(cardPath)}
+		gpu = &system.GPUData{Name: name}
 		gm.GpuDataMap[id] = gpu
 	}
 
@@ -302,6 +318,11 @@ func (gm *GPUManager) calculateIntelSysfsPower(cardID string, microjoules uint64
 }
 
 func (gm *GPUManager) readIntelSysfsPowerPkg(cardID, hwmonDir string, timestamp time.Time) (float64, bool) {
+	selected, energy, err := readIntelSysfsPackageCounter(hwmonDir)
+	return gm.calculateIntelSysfsPackagePower(cardID, selected, energy, err, timestamp)
+}
+
+func readIntelSysfsPackageCounter(hwmonDir string) (string, uint64, error) {
 	energyPaths, _ := filepath.Glob(filepath.Join(hwmonDir, "energy*_input"))
 	selected, fallback := "", ""
 	for _, path := range energyPaths {
@@ -321,6 +342,14 @@ func (gm *GPUManager) readIntelSysfsPowerPkg(cardID, hwmonDir string, timestamp 
 	if selected == "" {
 		selected = fallback
 	}
+	if selected == "" {
+		return "", 0, os.ErrNotExist
+	}
+	energy, err := readSysfsUint(selected)
+	return selected, energy, err
+}
+
+func (gm *GPUManager) calculateIntelSysfsPackagePower(cardID, selected string, energy uint64, err error, timestamp time.Time) (float64, bool) {
 	key := cardID + ":pkg:" + selected
 	// A changed/absent source invalidates its old interval, even if its values
 	// happen to be monotonic relative to the previous sensor's counter.
@@ -332,7 +361,6 @@ func (gm *GPUManager) readIntelSysfsPowerPkg(cardID, hwmonDir string, timestamp 
 	if selected == "" {
 		return 0, false
 	}
-	energy, err := readSysfsUint(selected)
 	if err != nil {
 		delete(gm.intelSysfsEnergySnapshots, key)
 		return 0, false
@@ -400,11 +428,16 @@ func getIntelSysfsGpuName(cardPath string) string {
 // this agent lifetime. Resolve the PCI device symlink, not the DRM card symlink.
 // History across process restarts retains legacy behavior (no identity migration).
 // Caller holds gm's mutex. The alias table has an explicit lifetime bound.
-func (gm *GPUManager) intelSysfsID(cardPath string) string {
+func intelSysfsDevice(cardPath string) string {
 	device, err := filepath.EvalSymlinks(filepath.Join(cardPath, "device"))
 	if err != nil {
 		device = filepath.Join(cardPath, "device")
 	}
+	return device
+}
+
+// Pure state operation: caller holds the manager mutex; no filesystem access.
+func (gm *GPUManager) intelSysfsID(cardPath, device string) string {
 	if id := gm.intelSysfsIDs[device]; id != "" {
 		return id
 	}
