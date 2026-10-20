@@ -11,10 +11,6 @@ services:
       TOKEN: ${LAB_AGENT_TOKEN}
       LISTEN: /var/lib/beszel-agent/lab.sock
       SENSORS: ""
-      # Experimental combined image only; defaults remain disabled:
-      # INTEL_SYSFS_MODE: suspend-aware
-      # INTEL_XE_DEBUGFS_MEMORY: "true"
-      # LOG_LEVEL: debug
     volumes:
       - /sys:/sys:ro
       - agent-data:/var/lib/beszel-agent
