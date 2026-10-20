@@ -240,6 +240,10 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	observed := time.Now()
 	now := intelSysfsNow()
 	pkgPath, pkgEnergy, pkgErr := readIntelSysfsPackageCounter(hwmonDir)
+	pkgNow := now
+	if pkgErr == nil {
+		pkgNow = intelSysfsNow()
+	}
 	temp := readIntelSysfsTemperature(hwmonDir)
 	usage, usageErr := readOptionalSysfsFloat(filepath.Join(devicePath, "gpu_busy_percent"))
 	memUsed, memUsedErr := readFirstOptionalSysfsFloat(
@@ -297,7 +301,7 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 
 	previous, hadBaseline := gm.intelSysfsEnergySnapshots[id]
 	power, hasPower := gm.calculateIntelSysfsPower(id, energy, now)
-	powerPkg, hasPowerPkg := gm.calculateIntelSysfsPackagePower(id, pkgPath, pkgEnergy, pkgErr, now)
+	powerPkg, hasPowerPkg := gm.calculateIntelSysfsPackagePower(id, pkgPath, pkgEnergy, pkgErr, pkgNow)
 
 	gpu, ok := gm.GpuDataMap[id]
 	if !ok {
@@ -439,7 +443,13 @@ func readIntelSysfsTemperature(hwmonDir string) float64 {
 }
 
 func readSysfsUint(path string) (uint64, error) {
+	started := time.Now()
 	val, err := readIntelSysfsNumber(path)
+	// Completion time is only a useful counter timestamp for a prompt read.
+	// This rejects uncertainty after return; it does not cancel a kernel read.
+	if time.Since(started) > 250*time.Millisecond {
+		return 0, fmt.Errorf("energy acquisition exceeded 250ms")
+	}
 	if err != nil {
 		slog.Debug("Failed to read sysfs value", "path", path, "error", err)
 		return 0, err

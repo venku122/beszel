@@ -722,3 +722,32 @@ func TestIntelSysfsUnreadableCandidateIsNotHealthy(t *testing.T) {
 	require.False(t, gm.pollIntelSysfs())
 	require.Empty(t, gm.GetCurrentData(1))
 }
+
+func TestIntelSysfsSlowPackageAcquisitionIsUnavailable(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	gm.updateIntelSysfsGpuData(card, hwmon)
+	pkg := filepath.Join(hwmon, "energy2_input")
+	require.NoError(t, os.Remove(pkg))
+	require.NoError(t, unix.Mkfifo(pkg, 0600))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	done := make(chan bool, 1)
+	go func() { done <- gm.updateIntelSysfsGpuData(card, hwmon) }()
+	fd := -1
+	require.Eventually(t, func() bool {
+		var err error
+		fd, err = unix.Open(pkg, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		return err == nil
+	}, time.Second, time.Millisecond)
+	// Exercise actual syscall timing uncertainty, rather than mocking the clock.
+	<-time.NewTimer(300 * time.Millisecond).C
+	_, err := unix.Write(fd, []byte("91000000"))
+	require.NoError(t, err)
+	require.NoError(t, unix.Close(fd))
+	require.True(t, <-done, "card interval remains valid")
+	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "slow package acquisition must be unavailable, not a spike")
+}
