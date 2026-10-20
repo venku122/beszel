@@ -18,7 +18,8 @@ Those reports describe additional feature branches not included in this PR.
 - Discovery and polling deduplicate physical devices, preserving the original
   card key and display name across disappear/reappear within this process.
   Identity/name caches are bounded to 64 devices; no cross-restart migration.
-- Discovery checks regular-file metadata without opening energy sensors.
+- Discovery checks regular-file and effective-user permission metadata without
+  opening energy sensors.
   Readability is established when polling, not guaranteed by startup detection.
   Priming, valid measurements and failed intervals are distinct. Failures use
   capped backoff; long gaps re-prime without a permanent retry trap. Warnings
@@ -40,24 +41,28 @@ rate-limited warnings and measured recovery have dedicated regressions.
 Three build-workflow tests reject stale executable reuse and dirty modified /
 staged / untracked source, and stop on compilation failure.
 
-Commands run in a Go 1.27.2 Linux container as UID65534:
+Go checks run in Go 1.27.2 Linux containers as UID65534:
 
 ```sh
 go test -tags='testing no_ui' ./...
 go vet ./agent/...
 go test -race -tags='testing no_ui' ./agent/...
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-w -s' -o build/beszel-agent-linux-amd64 ./internal/cmd/agent
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o build/beszel-agent-linux-arm64 ./internal/cmd/agent
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o build/beszel-agent-darwin-arm64 ./internal/cmd/agent
-python3 docs/gpu-intel-truenas/test-build-image.py
 ```
 
-Current corrective revision validation and hardware measurements are recorded
-below after completion; previous measurements alone do not validate new code.
+The Mac ran `python3 docs/gpu-intel-truenas/test-build-image.py` and
+`sh docs/gpu-intel-truenas/build-image.sh`; the latter compiles Linux/amd64
+inside its pinned Go container from an immutable source snapshot.
+
+Linux/amd64 passed the full suite and vet; Linux/ARM64 ran agent race tests and cross-builds. All 47 selected Intel
+parent/subtest entries also passed on TrueNAS as UID65534 with synthetic files,
+read-only root, bounded tmpfs, no devices/capabilities/network or host PID access.
+Independent review found no remaining blocker after the timing/permission fixes.
 
 ## Prior hardware evidence (before these corrections)
 
-TrueNAS SCALE25.10, Linux6.12.33, Xe B570. Upstream omitted card power in 119/180
+TrueNAS SCALE 25.10, Linux 6.12.33, Xe B570. Upstream omitted card power in 119/180
 one-second realtime updates; the original reliability source retained 1800/1800
 over 30 minutes. Controlled 4K HEVC Main10 HDR/DoVi → H264 1080p confirmed VAAPI
 decode/encode and return to idle. This establishes the original continuity fix,
@@ -69,7 +74,7 @@ no Intel temperature sensor is exposed. Wire/UI availability limitations remain.
 [Compose](compose.yaml) uses a dedicated lab identity and managed volume,
 read-only /sys, all capabilities dropped, private PID namespace, no Docker
 socket/render node, and no public ports. Never share production state or keys.
-[Mac hub](hub.compose.yaml) stays LAN-only on port18090. Create/update only the
+[Mac hub](hub.compose.yaml) stays LAN-only on port 18090. Create/update only the
 TrueNAS Custom App `beszel-intel-lab`. app.update preserves STOPPED state; start
 only this lab explicitly when needed. Stop only this lab to roll back; preserve
 its managed storage. No production service, kernel, PCI or PM changes are needed.
@@ -78,3 +83,66 @@ Build from a clean committed checkout with `sh docs/gpu-intel-truenas/build-imag
 Only /agent changes in the pinned official Intel image. Transfer with docker
 save/load; do not publish the development image. Check source/binary provenance
 before starting a measurement. Large logs, images and binaries remain outside Git.
+
+## Fresh corrective hardware acceptance — 2026-10-20
+
+Tested source **e89dbb63ae04a130b251bd3897700aef3fb681b5**, incorporating upstream
+**0fb738de**. Image `beszel-intel-lab:e89dbb63ae04`; actual deployed /agent SHA256
+`99191d040afe8059b7878eecd62ba36b8abaa1bacfd78245a71309164dcb547e` matches
+both the image label and provenance manifest. Later documentation/lock-comment
+edits do not change the tested runtime implementation. No experimental telemetry
+code was added. Older experimental branches need rebasing onto this corrected core.
+
+With `GPU_COLLECTOR=amd_sysfs,intel_sysfs`, **1800/1800** one-second observations
+contained both AMD Cezanne and Intel B570. No Intel card/package power fields
+were missing. Maximum update gap **1.085 s**. A fresh mixed subscription received
+20/20 more updates, proving collection continued beyond the initial capture.
+
+| Phase | Updates | Mean Intel card W | Mean package W |
+| --- | ---: | ---: | ---: |
+| Idle, at least 15 minutes | 903 | 30.465 | 15.901 |
+| Controlled transcode | 182 | 61.027 | 38.056 |
+| Return to idle, including tail | 715 | 30.624 | 16.018 |
+
+Plex confirmed VAAPI decode/encode and full hardware pipeline; the specific
+controlled transcoder command confirmed H.264 1080p scaling from 4K HEVC10-bit
+HDR/DoVi. The test session stopped normally after about 182 seconds /145 HLS
+segments. No pre-existing session was interrupted. Power is driver-derived,
+not externally calibrated. AMD memory/power data remained present; these values
+retain the existing AMD collector's accounting semantics.
+
+Thirty-minute container resources: **0.17467% of one CPU core**, memory
+**12.11–15.28 MiB**, first 12.11/last 14.69 MiB; PID/thread count **21–21**.
+Agent process descriptors **6→6**, disk write_bytes **0→0**, no restart, and
+zero GPU warning/error lines in the complete bounded log tail (4096-line cap).
+This is a mixed-collector result, including brief snapshot commands; compared
+with the earlier Intel-only 0.1400% result, delta is +0.03467 percentage points.
+Different source/baseline, collector selection and workload windows prevent a
+causal overhead claim. This window alone does not prove indefinite leak freedom.
+
+PM-only lab-stopped baseline: 721 observations over 180s, all active,
++180000ms active/+0 suspended. Mixed run: 1801 observations over 1800s, all active,
++1800000ms active/+0 suspended. Other GPU clients stayed untouched. There is no
+live sleep-preservation or power-saving proof. No GPU reset/module operation
+was performed; disruptive recovery and alias scenarios remain fixture-only.
+
+Final cleanup restored Intel-only selection on the corrected image: one startup
+priming sample was unavailable, then 19/19 had power; the lab was STOPPED. Production Plex and the existing Beszel
+container retain their original IDs/images/states/start times/restart counts.
+Operational Plex token caches are removed; dedicated lab identity/storage and
+images remain private. Detailed sanitized logs and provenance stay outside Git
+in Mayor `artifacts/beszel-intel-v2/review-2026-10-20/`; exportable binaries,
+image, patches and checksums are in `artifacts/beszel-intel-v2/review-release/`.
+
+## Test isolation observation
+
+A final native Linux/ARM64 default-parallel suite run failed
+`TestAgentWebSocketIntegration/fingerprint_mismatch_should_be_rejected` during
+cleanup: `remove /dev/shm/beszel_health: no such file or directory`. The shared
+health-file cleanup uses os.Remove without ignoring absence, and package test
+processes share /dev/shm. This failure is not a GPU assertion and is retained in
+`review-native-all-final.log`. The isolated case passed 10/10. A serialized full
+suite (`go test -p 1 -count=1 -tags='testing no_ui' ./...`) was run as a test
+isolation workaround and passed in full. No unrelated health/runtime source
+was changed to hide the failure. The missing file is consistent with shared
+health-file use across parallel package test processes.

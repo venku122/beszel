@@ -496,10 +496,10 @@ func getIntelSysfsGpuName(cardPath string) string {
 	return fmt.Sprintf("Intel GPU %s", filepath.Base(cardPath))
 }
 
-// intelSysfsID preserves the first observed cardN key across re-enumeration in
-// this agent lifetime. Resolve the PCI device symlink, not the DRM card symlink.
-// History across process restarts retains legacy behavior (no identity migration).
-// Caller holds gm's mutex. The alias table has an explicit lifetime bound.
+// intelSysfsDevice resolves the PCI device symlink, not the DRM card symlink.
+// Call outside gm's mutex: filesystem metadata operations can also block.
+// The separate state helper below preserves the first cardN key within a run.
+// History across process restarts retains legacy behavior (no migration).
 func intelSysfsDevice(cardPath string) string {
 	device, err := filepath.EvalSymlinks(filepath.Join(cardPath, "device"))
 	if err != nil {
