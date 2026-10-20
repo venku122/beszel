@@ -52,6 +52,7 @@ type GPUManager struct {
 	// Per-card energy snapshots for Intel sysfs power calculation.
 	intelSysfsEnergySnapshots map[string]intelSysfsEnergySnapshot
 	intelSysfsIDs             map[string]string
+	intelSysfsNames           map[string]string
 	intelSysfsSensorPaths     map[string]string
 	// Internal sysfs freshness; never serialized. Access under the manager mutex.
 	intelSysfsSamples       map[string]time.Time

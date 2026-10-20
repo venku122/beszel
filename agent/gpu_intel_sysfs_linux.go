@@ -86,6 +86,9 @@ func (gm *GPUManager) collectIntelSysfsStatsContext(ctx context.Context) {
 // Discovery is metadata-only: it must not read energy just to detect hardware.
 // This also recovers hwmon paths changed during driver reinitialization.
 func (gm *GPUManager) pollIntelSysfs() bool {
+	if gm.intelSysfsStopped() {
+		return false
+	}
 	cards, err := discoverIntelSysfsCards()
 	if err != nil {
 		return false
@@ -93,6 +96,9 @@ func (gm *GPUManager) pollIntelSysfs() bool {
 	seen := make(map[string]bool, len(cards))
 	hasData := false
 	for _, card := range cards {
+		if gm.intelSysfsStopped() {
+			return false
+		}
 		device := intelSysfsDevice(card.cardPath)
 		gm.Lock()
 		id := gm.intelSysfsID(card.cardPath, device)
@@ -137,6 +143,7 @@ func discoverIntelSysfsCards() ([]intelSysfsCard, error) {
 	}
 
 	var cards []intelSysfsCard
+	seenDevices := make(map[string]bool)
 	for _, cardPath := range paths {
 		if strings.Contains(filepath.Base(cardPath), "-") || !isIntelGpu(cardPath) {
 			continue
@@ -145,6 +152,11 @@ func discoverIntelSysfsCards() ([]intelSysfsCard, error) {
 		if hwmonDir == "" {
 			continue
 		}
+		device := intelSysfsDevice(cardPath)
+		if seenDevices[device] {
+			continue
+		}
+		seenDevices[device] = true
 		cards = append(cards, intelSysfsCard{cardPath: cardPath, hwmonDir: hwmonDir})
 	}
 	return cards, nil
@@ -185,6 +197,9 @@ func sysfsFileExists(path string) bool {
 func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	// All filesystem operations, including metadata and optional sensors, occur
 	// outside the manager lock. A kernel-stalled read must not freeze hub stats.
+	if gm.intelSysfsStopped() {
+		return false
+	}
 	started := time.Now()
 	devicePath := filepath.Join(cardPath, "device")
 	device := intelSysfsDevice(cardPath)
@@ -194,6 +209,7 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	}
 	name := getIntelSysfsGpuName(cardPath)
 	energy, energyErr := readSysfsUint(filepath.Join(hwmonDir, "energy1_input"))
+	observed := time.Now()
 	now := intelSysfsNow()
 	pkgPath, pkgEnergy, pkgErr := readIntelSysfsPackageCounter(hwmonDir)
 	temp := readIntelSysfsTemperature(hwmonDir)
@@ -256,6 +272,14 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 
 	gpu, ok := gm.GpuDataMap[id]
 	if !ok {
+		if gm.intelSysfsNames == nil {
+			gm.intelSysfsNames = make(map[string]string)
+		}
+		if stable := gm.intelSysfsNames[device]; stable != "" {
+			name = stable
+		} else {
+			gm.intelSysfsNames[device] = name
+		}
 		gpu = &system.GPUData{Name: name}
 		gm.GpuDataMap[id] = gpu
 	}
@@ -284,7 +308,7 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	}
 	if hasPower {
 		gpu.Count++
-		gm.intelSysfsSamples[id] = time.Now()
+		gm.intelSysfsSamples[id] = observed
 	}
 	return true
 }
@@ -474,4 +498,10 @@ func readIntelSysfsNumber(path string) (string, error) {
 		return "", fmt.Errorf("sysfs number exceeds 64 bytes")
 	}
 	return string(data), nil
+}
+
+func (gm *GPUManager) intelSysfsStopped() bool {
+	gm.Lock()
+	defer gm.Unlock()
+	return gm.collectorStopped
 }

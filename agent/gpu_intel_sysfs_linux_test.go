@@ -490,9 +490,12 @@ func blockedIntelCollector(t *testing.T) (*GPUManager, func()) {
 	_, card, hwmon := setupIntelSysfsTest(t)
 	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	gm := &GPUManager{GpuDataMap: map[string]*system.GPUData{"amd-card1": {Name: "AMD", Temperature: 50, Count: 1}}}
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	gm.intelSysfsEnergySnapshots["card0"] = intelSysfsEnergySnapshot{microjoules: 1000000, timestamp: time.Now().Add(-3 * time.Second)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
 	fifo := filepath.Join(hwmon, "temp1_input")
 	require.NoError(t, unix.Mkfifo(fifo, 0600))
-	gm := &GPUManager{GpuDataMap: map[string]*system.GPUData{"amd-card1": {Name: "AMD", Temperature: 50, Count: 1}}}
 	require.True(t, gm.startIntelSysfsCollector())
 	fd := -1
 	require.Eventually(t, func() bool {
@@ -540,4 +543,104 @@ func TestIntelSysfsBlockedReadDoesNotFreezeShutdown(t *testing.T) {
 	}
 	require.False(t, gm.startIntelSysfsCollector(), "stopped manager must not create replacement blocked workers")
 	require.NotContains(t, gm.GetCurrentData(1), "card0", "late read committed after cancellation")
+}
+
+func intelPCIFixture(t *testing.T) (root, pci, hwmon string) {
+	t.Helper()
+	root, _, _ = setupIntelSysfsTest(t)
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "card0")))
+	pci = filepath.Join(root, "0000:12:00.0")
+	hwmon = filepath.Join(pci, "hwmon/hwmon0")
+	require.NoError(t, os.MkdirAll(hwmon, 0755))
+	writeIntelSysfsFile(t, pci, "vendor", "0x8086")
+	return
+}
+func intelCardAlias(t *testing.T, root, pci, name string) {
+	t.Helper()
+	card := filepath.Join(root, name)
+	require.NoError(t, os.Mkdir(card, 0755))
+	require.NoError(t, os.Symlink(pci, filepath.Join(card, "device")))
+}
+func TestIntelSysfsPollDeduplicatesPhysicalGPU(t *testing.T) {
+	root, pci, hwmon := intelPCIFixture(t)
+	intelCardAlias(t, root, pci, "card0")
+	intelCardAlias(t, root, pci, "card2")
+	now := time.Unix(100, 0)
+	old := intelSysfsNow
+	t.Cleanup(func() { intelSysfsNow = old })
+	intelSysfsNow = func() time.Time { r := now; now = now.Add(3 * time.Second); return r }
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	gm.pollIntelSysfs()
+	require.Zero(t, gm.GpuDataMap["card0"].Count, "one physical GPU must prime once per cycle")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	gm.pollIntelSysfs()
+	require.Equal(t, 1.0, gm.GpuDataMap["card0"].Count)
+	require.Equal(t, 30.0, gm.GetCurrentData(1)["card0"].Power)
+}
+func TestIntelSysfsDisappearRecreatePreservesName(t *testing.T) {
+	root, pci, hwmon := intelPCIFixture(t)
+	intelCardAlias(t, root, pci, "card0")
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	gm.pollIntelSysfs()
+	require.Equal(t, "Intel GPU card0", gm.GpuDataMap["card0"].Name)
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "card0")))
+	gm.pollIntelSysfs()
+	require.Empty(t, gm.GpuDataMap)
+	intelCardAlias(t, root, pci, "card2")
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	gm.pollIntelSysfs()
+	require.Equal(t, "Intel GPU card0", gm.GpuDataMap["card0"].Name)
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	setIntelSysfsTime(t, time.Unix(106, 0))
+	gm.pollIntelSysfs()
+	require.Equal(t, "Intel GPU card0", gm.GetCurrentData(1)["card0"].Name)
+}
+
+func TestIntelSysfsFreshnessUsesEnergyObservation(t *testing.T) {
+	gm, release := blockedIntelCollector(t)
+	// The counter was observed before the optional sensor FIFO rendezvous.
+	beforeRelease := time.Now()
+	release()
+	require.Eventually(t, func() bool { gm.Lock(); defer gm.Unlock(); return !gm.intelSysfsSamples["card0"].IsZero() }, time.Second, time.Millisecond)
+	gm.Lock()
+	observed := gm.intelSysfsSamples["card0"]
+	gm.Unlock()
+	require.True(t, observed.Before(beforeRelease), "optional reads must not extend energy freshness")
+}
+
+func TestIntelSysfsShutdownDoesNotVisitNextBlockedCard(t *testing.T) {
+	root, card, hwmon := setupIntelSysfsTest(t)
+	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	first := filepath.Join(hwmon, "temp1_input")
+	require.NoError(t, unix.Mkfifo(first, 0600))
+	secondHwmon := filepath.Join(root, "card1/device/hwmon/hwmon1")
+	require.NoError(t, os.MkdirAll(secondHwmon, 0755))
+	writeIntelSysfsFile(t, filepath.Join(root, "card1/device"), "vendor", "0x8086")
+	writeIntelSysfsFile(t, secondHwmon, "energy1_input", "1000000")
+	second := filepath.Join(secondHwmon, "temp1_input")
+	require.NoError(t, unix.Mkfifo(second, 0600))
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	require.True(t, gm.startIntelSysfsCollector())
+	fd := -1
+	require.Eventually(t, func() bool {
+		var err error
+		fd, err = unix.Open(first, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		return err == nil
+	}, time.Second, time.Millisecond)
+	gm.stopCollectors()
+	require.NoError(t, unix.Close(fd))
+	select {
+	case <-gm.collectorDone:
+	case <-time.After(time.Second):
+		// Unstick a regressed implementation so its goroutine cannot escape the test.
+		if fd, err := unix.Open(second, unix.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+			unix.Close(fd)
+		}
+		<-gm.collectorDone
+		t.Fatal("cancelled collector visited second blocking sensor")
+	}
 }
