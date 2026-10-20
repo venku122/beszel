@@ -3,8 +3,11 @@
 package agent
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -38,50 +41,89 @@ func (gm *GPUManager) hasIntelSysfs() bool {
 
 // startIntelSysfsCollector starts Intel GPU collection via sysfs.
 func (gm *GPUManager) startIntelSysfsCollector() bool {
+	gm.Lock()
+	defer gm.Unlock()
+	if gm.collectorCancel != nil {
+		return true
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gm.collectorCancel = cancel
+	gm.collectorWG.Add(1)
 	go func() {
-		if err := gm.collectIntelSysfsStats(); err != nil {
-			slog.Warn("Error collecting Intel GPU data via sysfs", "err", err)
-		}
+		defer gm.collectorWG.Done()
+		gm.collectIntelSysfsStatsContext(ctx)
 	}()
 	return true
 }
 
-// collectIntelSysfsStats collects Intel GPU metrics directly from DRM sysfs / hwmon.
-func (gm *GPUManager) collectIntelSysfsStats() error {
-	sysfsPollInterval := 3000 * time.Millisecond
+// Retry discovery with capped backoff instead of permanently losing telemetry
+// after a reset or temporary sensor disappearance. Every wait is cancellable.
+func (gm *GPUManager) collectIntelSysfsStatsContext(ctx context.Context) {
+	delay := 3 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		hasData := gm.pollIntelSysfs()
+		if hasData {
+			delay = 3 * time.Second
+		} else {
+			delay = min(max(delay*2, 5*time.Second), time.Minute)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// Discovery is metadata-only: it must not read energy just to detect hardware.
+// This also recovers hwmon paths changed during driver reinitialization.
+func (gm *GPUManager) pollIntelSysfs() bool {
 	cards, err := discoverIntelSysfsCards()
 	if err != nil {
-		return err
+		return false
 	}
-	if len(cards) == 0 {
-		return errNoValidData
-	}
-
-	slog.Debug("Using sysfs for Intel GPU data collection", "cards", len(cards))
+	seen := make(map[string]bool, len(cards))
+	hasData := false
 	for _, card := range cards {
-		slog.Debug("Intel sysfs card detected", "card", filepath.Base(card.cardPath), "hwmon", card.hwmonDir)
-	}
-
-	failures := 0
-	for {
-		hasData := false
-		for _, card := range cards {
-			if gm.updateIntelSysfsGpuData(card.cardPath, card.hwmonDir) {
-				hasData = true
-			}
-		}
-		if !hasData {
-			failures++
-			if failures > maxFailureRetries {
-				return errNoValidData
-			}
-			slog.Warn("No Intel GPU data from sysfs", "failures", failures)
-			time.Sleep(retryWaitTime)
+		gm.Lock()
+		id := gm.intelSysfsID(card.cardPath)
+		gm.Unlock()
+		if id == "" {
 			continue
 		}
-		failures = 0
-		time.Sleep(sysfsPollInterval)
+		seen[id] = true
+		if gm.updateIntelSysfsGpuData(card.cardPath, card.hwmonDir) {
+			hasData = true
+		}
 	}
+	gm.Lock()
+	defer gm.Unlock()
+	for id := range gm.intelSysfsSamples {
+		if !seen[id] {
+			gm.intelSysfsSamples[id] = time.Time{}
+			// Drop removed devices and their cache entries to bound rediscovery state.
+			delete(gm.GpuDataMap, id)
+			delete(gm.lastAvgData, id)
+			delete(gm.intelSysfsSamples, id)
+			delete(gm.intelSysfsPackageCounts, id)
+			delete(gm.intelSysfsPackageValid, id)
+			delete(gm.intelSysfsSensorPaths, id)
+			for _, snapshots := range gm.lastSnapshots {
+				delete(snapshots, id)
+			}
+			for key := range gm.intelSysfsEnergySnapshots {
+				if key == id || strings.HasPrefix(key, id+":") {
+					delete(gm.intelSysfsEnergySnapshots, key)
+				}
+			}
+		}
+	}
+	return hasData
 }
 
 func discoverIntelSysfsCards() ([]intelSysfsCard, error) {
@@ -130,7 +172,7 @@ func findIntelEnergyHwmon(devicePath string) string {
 }
 
 func sysfsFileExists(path string) bool {
-	_, err := utils.ReadStringFileLimited(path, 1)
+	_, err := os.Stat(path)
 	return err == nil
 }
 
@@ -138,10 +180,45 @@ func sysfsFileExists(path string) bool {
 // Returns true if the required energy counter was read successfully.
 func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	devicePath := filepath.Join(cardPath, "device")
-	id := filepath.Base(cardPath)
+	gm.Lock()
+	defer gm.Unlock()
+	id := gm.intelSysfsID(cardPath)
+	if id == "" {
+		return false
+	}
+	if gm.intelSysfsSensorPaths == nil {
+		gm.intelSysfsSensorPaths = make(map[string]string)
+	}
+	sensorPath, err := filepath.EvalSymlinks(hwmonDir)
+	if err != nil {
+		sensorPath = hwmonDir
+	}
+	if gm.intelSysfsSensorPaths[id] != sensorPath {
+		delete(gm.intelSysfsEnergySnapshots, id)
+		for key := range gm.intelSysfsEnergySnapshots {
+			if strings.HasPrefix(key, id+":") {
+				delete(gm.intelSysfsEnergySnapshots, key)
+			}
+		}
+		gm.intelSysfsSensorPaths[id] = sensorPath
+	}
+	if gm.intelSysfsSamples == nil {
+		gm.intelSysfsSamples = make(map[string]time.Time)
+		gm.intelSysfsPackageCounts = make(map[string]uint32)
+		gm.intelSysfsPackageValid = make(map[string]bool)
+	}
+	gm.intelSysfsSamples[id] = time.Time{}
+	gm.intelSysfsPackageValid[id] = false
 
 	energy, err := readSysfsUint(filepath.Join(hwmonDir, "energy1_input"))
 	if err != nil {
+		delete(gm.intelSysfsEnergySnapshots, id)
+		// No interval may bridge an unreadable counter.
+		for key := range gm.intelSysfsEnergySnapshots {
+			if strings.HasPrefix(key, id+":") {
+				delete(gm.intelSysfsEnergySnapshots, key)
+			}
+		}
 		return false
 	}
 
@@ -161,16 +238,14 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 		filepath.Join(devicePath, "mem_info_local_mem_total"),
 	)
 
-	gm.Lock()
-	defer gm.Unlock()
-
 	gpu, ok := gm.GpuDataMap[id]
 	if !ok {
 		gpu = &system.GPUData{Name: getIntelSysfsGpuName(cardPath)}
 		gm.GpuDataMap[id] = gpu
 	}
 
-	if usageErr == nil {
+	gpu.Temperature, gpu.MemoryUsed, gpu.MemoryTotal = 0, 0, 0
+	if usageErr == nil && hasPower {
 		gpu.Usage += usage
 	}
 	if memUsedErr == nil {
@@ -186,10 +261,15 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 		gpu.Power += power
 		slog.Debug("Computed Intel sysfs GPU power", "card", id, "watts", power)
 	}
-	if hasPowerPkg {
+	if hasPower && hasPowerPkg {
 		gpu.PowerPkg += powerPkg
+		gm.intelSysfsPackageCounts[id]++
+		gm.intelSysfsPackageValid[id] = true
 	}
-	gpu.Count++
+	if hasPower {
+		gpu.Count++
+		gm.intelSysfsSamples[id] = time.Now()
+	}
 	return true
 }
 
@@ -208,32 +288,62 @@ func (gm *GPUManager) calculateIntelSysfsPower(cardID string, microjoules uint64
 		return 0, false
 	}
 	elapsed := timestamp.Sub(last.timestamp).Seconds()
-	if elapsed <= 0 {
+	if elapsed <= 0 || elapsed > 15 {
 		return 0, false
 	}
 	delta := microjoules - last.microjoules
-	return float64(delta) / 1_000_000.0 / elapsed, true
+	watts := float64(delta) / 1_000_000.0 / elapsed
+	// A conservative sanity ceiling, not the configured or rated power limit.
+	// Reject corrupted samples without clamping them into plausible readings.
+	if watts > 2000 {
+		return 0, false
+	}
+	return watts, true
 }
 
 func (gm *GPUManager) readIntelSysfsPowerPkg(cardID, hwmonDir string, timestamp time.Time) (float64, bool) {
 	energyPaths, _ := filepath.Glob(filepath.Join(hwmonDir, "energy*_input"))
+	selected, fallback := "", ""
 	for _, path := range energyPaths {
 		if filepath.Base(path) == "energy1_input" {
 			continue
 		}
-		energy, err := readSysfsUint(path)
-		if err != nil {
-			continue
+		label, err := utils.ReadStringFileLimited(strings.TrimSuffix(path, "_input")+"_label", 64)
+		if err == nil {
+			if strings.TrimSpace(label) == "pkg" {
+				selected = path
+				break
+			}
+		} else if os.IsNotExist(err) && filepath.Base(path) == "energy2_input" {
+			fallback = path
 		}
-		return gm.calculateIntelSysfsPower(cardID+":"+filepath.Base(path), energy, timestamp)
 	}
-	return 0, false
+	if selected == "" {
+		selected = fallback
+	}
+	key := cardID + ":pkg:" + selected
+	// A changed/absent source invalidates its old interval, even if its values
+	// happen to be monotonic relative to the previous sensor's counter.
+	for old := range gm.intelSysfsEnergySnapshots {
+		if strings.HasPrefix(old, cardID+":pkg:") && old != key {
+			delete(gm.intelSysfsEnergySnapshots, old)
+		}
+	}
+	if selected == "" {
+		return 0, false
+	}
+	energy, err := readSysfsUint(selected)
+	if err != nil {
+		delete(gm.intelSysfsEnergySnapshots, key)
+		return 0, false
+	}
+	return gm.calculateIntelSysfsPower(key, energy, timestamp)
 }
 
 func readIntelSysfsTemperature(hwmonDir string) float64 {
 	tempPaths, _ := filepath.Glob(filepath.Join(hwmonDir, "temp*_input"))
 	for _, path := range tempPaths {
-		temp, err := readSysfsFloat(path)
+		temp, err := readOptionalSysfsFloat(path)
 		if err == nil && temp > 0 {
 			return temp / 1000.0
 		}
@@ -242,7 +352,7 @@ func readIntelSysfsTemperature(hwmonDir string) float64 {
 }
 
 func readSysfsUint(path string) (uint64, error) {
-	val, err := utils.ReadStringFileLimited(path, 64)
+	val, err := readIntelSysfsNumber(path)
 	if err != nil {
 		slog.Debug("Failed to read sysfs value", "path", path, "error", err)
 		return 0, err
@@ -251,11 +361,18 @@ func readSysfsUint(path string) (uint64, error) {
 }
 
 func readOptionalSysfsFloat(path string) (float64, error) {
-	val, err := os.ReadFile(path)
+	val, err := readIntelSysfsNumber(path)
 	if err != nil {
 		return 0, err
 	}
-	return strconv.ParseFloat(strings.TrimSpace(string(val)), 64)
+	number, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+		return 0, fmt.Errorf("invalid sysfs number")
+	}
+	return number, nil
 }
 
 func readFirstOptionalSysfsFloat(paths ...string) (float64, error) {
@@ -277,4 +394,51 @@ func getIntelSysfsGpuName(cardPath string) string {
 		return strings.TrimSpace(name)
 	}
 	return fmt.Sprintf("Intel GPU %s", filepath.Base(cardPath))
+}
+
+// intelSysfsID preserves the first observed cardN key across re-enumeration in
+// this agent lifetime. Resolve the PCI device symlink, not the DRM card symlink.
+// History across process restarts retains legacy behavior (no identity migration).
+// Caller holds gm's mutex. The alias table has an explicit lifetime bound.
+func (gm *GPUManager) intelSysfsID(cardPath string) string {
+	device, err := filepath.EvalSymlinks(filepath.Join(cardPath, "device"))
+	if err != nil {
+		device = filepath.Join(cardPath, "device")
+	}
+	if id := gm.intelSysfsIDs[device]; id != "" {
+		return id
+	}
+	if len(gm.intelSysfsIDs) >= 64 {
+		return ""
+	}
+	if gm.intelSysfsIDs == nil {
+		gm.intelSysfsIDs = make(map[string]string)
+	}
+	id := filepath.Base(cardPath)
+	for _, used := range gm.intelSysfsIDs {
+		if used == id {
+			id += "-" + filepath.Base(device)
+			break
+		}
+	}
+	gm.intelSysfsIDs[device] = id
+	return id
+}
+
+// Read one bounded sysfs number, rejecting truncation instead of accepting its
+// numeric prefix. The extra byte detects values longer than the ABI permits.
+func readIntelSysfsNumber(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 65))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > 64 {
+		return "", fmt.Errorf("sysfs number exceeds 64 bytes")
+	}
+	return string(data), nil
 }

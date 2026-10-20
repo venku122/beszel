@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -50,10 +51,20 @@ type GPUManager struct {
 	lastSnapshots map[uint16]map[string]*gpuSnapshot
 	// Per-card energy snapshots for Intel sysfs power calculation.
 	intelSysfsEnergySnapshots map[string]intelSysfsEnergySnapshot
+	intelSysfsIDs             map[string]string
+	intelSysfsSensorPaths     map[string]string
+	// Internal sysfs freshness; never serialized. Access under the manager mutex.
+	intelSysfsSamples       map[string]time.Time
+	intelSysfsPackageCounts map[string]uint32
+	intelSysfsPackageValid  map[string]bool
+	collectorCancel         context.CancelFunc
+	collectorWG             sync.WaitGroup
 }
 
 // gpuSnapshot stores the last observed incremental values for delta tracking
 type gpuSnapshot struct {
+	average  system.GPUData
+	pkgCount uint32
 	count    uint32
 	usage    float64
 	power    float64
@@ -317,9 +328,16 @@ func (gm *GPUManager) GetCurrentData(cacheKey uint16) map[string]system.GPUData 
 
 	gpuData := make(map[string]system.GPUData, len(gm.GpuDataMap))
 	for id, gpu := range gm.GpuDataMap {
+		if sampled, sysfs := gm.intelSysfsSamples[id]; sysfs && (sampled.IsZero() || time.Since(sampled) > 10*time.Second) {
+			continue
+		}
 		gpuAvg := gm.calculateGPUAverage(id, gpu, cacheKey)
+		if _, sysfs := gm.intelSysfsSamples[id]; sysfs && !gm.intelSysfsPackageValid[id] {
+			gpuAvg.PowerPkg = 0
+		}
 		gm.updateInstantaneousValues(&gpuAvg, gpu)
 		gm.storeSnapshot(id, gpu, cacheKey)
+		gm.lastSnapshots[cacheKey][id].average = gpuAvg
 
 		// Append id to name if there are multiple GPUs with the same name
 		if nameCounts[gpu.Name] > 1 {
@@ -361,9 +379,12 @@ func (gm *GPUManager) calculateGPUAverage(id string, gpu *system.GPUData, cacheK
 
 	// If no new data arrived
 	if deltaCount == 0 {
+		if _, sysfs := gm.intelSysfsSamples[id]; sysfs && lastSnapshot != nil {
+			return lastSnapshot.average
+		}
 		// Only discrete GPUs report temp/memory, so treat all-zero as suspended (return zeros).
 		// Engine-based (Intel) GPUs don't, so carry the last average forward across sample gaps.
-		if gpu.Engines == nil && gpu.Temperature == 0 && gpu.MemoryUsed == 0 {
+		if _, sysfs := gm.intelSysfsSamples[id]; !sysfs && gpu.Engines == nil && gpu.Temperature == 0 && gpu.MemoryUsed == 0 {
 			return system.GPUData{Name: gpu.Name}
 		}
 		lastAvg := gm.lastAvgData[id] // zero value if not found
@@ -380,6 +401,16 @@ func (gm *GPUManager) calculateGPUAverage(id string, gpu *system.GPUData, cacheK
 	gpuAvg.Power = utils.TwoDecimals(deltaPower / float64(deltaCount))
 
 	gpuAvg.PowerPkg = utils.TwoDecimals(deltaPowerPkg / float64(deltaCount))
+	if _, sysfs := gm.intelSysfsSamples[id]; sysfs {
+		count := gm.intelSysfsPackageCounts[id]
+		if lastSnapshot != nil {
+			count -= lastSnapshot.pkgCount
+		}
+		gpuAvg.PowerPkg = 0
+		if count > 0 {
+			gpuAvg.PowerPkg = utils.TwoDecimals(deltaPowerPkg / float64(count))
+		}
+	}
 
 	if gpu.Engines != nil {
 		// make fresh map for averaged engine metrics to avoid mutating
@@ -438,6 +469,7 @@ func (gm *GPUManager) updateInstantaneousValues(gpuAvg *system.GPUData, gpu *sys
 // storeSnapshot saves the current GPU state for this cache key
 func (gm *GPUManager) storeSnapshot(id string, gpu *system.GPUData, cacheKey uint16) {
 	snapshot := &gpuSnapshot{
+		pkgCount: gm.intelSysfsPackageCounts[id],
 		count:    uint32(gpu.Count),
 		usage:    gpu.Usage,
 		power:    gpu.Power,
@@ -811,4 +843,15 @@ func NewGPUManager() (*GPUManager, error) {
 	}
 
 	return &gm, nil
+}
+
+// stopCollectors cancels and joins background collectors that support shutdown.
+func (gm *GPUManager) stopCollectors() {
+	gm.Lock()
+	cancel := gm.collectorCancel
+	gm.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	gm.collectorWG.Wait()
 }
