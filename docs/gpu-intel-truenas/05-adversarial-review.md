@@ -47,3 +47,14 @@ Separate reviews:
 - Standalone DRM probes: review checked query ABI/permission handling. Per-client
   sample timing was corrected and excessive observation-span/nonpositive timing
   tests added. Probe engine visibility is not complete device utilization.
+
+## Follow-up optional VRAM / fdinfo review
+
+Independent review accepted the raw throttle-status naming and cycle-ratio PoC.
+The debugfs reader initially validated a DRM pathname then reopened region paths;
+review identified minor-reassignment TOCTOU. Fix: os.OpenRoot pins the directory,
+all identity/region reads use relative opens, identity is revalidated afterward.
+A deterministic rename/replacement fixture tests the old directory's identity.
+Review found no remaining blocker after that change. Unit/race tests supplement
+hardware checks; neither proves sleep preservation or stable debugfs ABI.
+Kernel-blocked reads and legacy wire availability limitations remain explicit.

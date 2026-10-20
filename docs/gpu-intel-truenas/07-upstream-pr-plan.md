@@ -28,7 +28,7 @@ Known limitation: existing wire/UI zero and missing-value semantics remain.
 
 ## PR 2: Xe observations
 
-Implemented on `feat/intel-xe-observability` at a81dc7cd after PR1 hardware
+Implemented on `feat/intel-xe-observability` at 1b1b7053 after PR1 hardware
 validation, currently diagnostic-only. Per-tile/per-GT
 frequencies and throttle flags must retain GT identity, never summed clock
 values. B570 frequency/throttle files exist; temperature does not. No hub
@@ -36,7 +36,7 @@ schema/frontend work before maintainer discussion. Do not depend on open #2562.
 
 ## PR 3: optional suspend-aware polling
 
-Implemented on `feat/intel-sysfs-suspend-aware` at 2c65b04ff769, depending on
+Implemented on `feat/intel-sysfs-suspend-aware` at fe47c9b8, depending on
 PR1 and the Xe diagnostic prototype. Default legacy polling is retained.
 Active-state hardware checks supplement synthetic suspended-state tests; no
 live sleep-preservation evidence, so this remains experimental.
@@ -64,9 +64,21 @@ Branch `fix/gpu-package-power-rollup`, base ca7f75ef, no dependency on PR1.
 Preserve existing GPU PowerPkg during accumulation and division, with a
 reproduced failing regression and repeated-tier test. No new schema fields or
 migration; this fixes disappearing historical package power, separately from
-realtime collector continuity. Lab/production hub deployment is not claimed.
+realtime collector continuity. The isolated Mac hub now verifies both 10m and 20m aggregation; production remains unchanged.
 
 DRM probe source is isolated on `experiment/xe-drm-telemetry`, not bundled into
 the reliability PR. Its hardware result proves usable VRAM total via a read-only
 render mapping without capabilities. Used memory and host-complete engine
 utilization do not meet default-deployment requirements and are not integrated.
+
+## Additional experimental branch after hardware discovery
+
+`feat/intel-xe-debugfs-memory` d57309ff depends only on core PR1 and is separate
+from native DRM probes. Default-off, bounded, identity-pinned TTM allocation
+counter reader reuses existing GPU memory fields. It requires existing readable
+debugfs and remains kernel-specific; upstream acceptance needs maintainer input
+on unstable diagnostic ABI and the meaning of allocated usable VRAM.
+`lab/intel-xe-verified-features` 038cd368a7e5 combines the separate feature commits
+for hardware validation, not one enormous upstream PR.
+DRM PoC e69b61c9 adds scoped fdinfo cycle ratios; retain as a standalone tool.
+It does not meet global-utilization/default-process-discovery acceptance.

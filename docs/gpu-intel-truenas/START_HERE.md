@@ -10,8 +10,8 @@ publication occurred. Source commit: **4aadc51a7e6f**, branch
 Upstream lost card-power fields in 119 of 180 one-second realtime updates.
 The development agent produced 1800 updates with **zero missing power fields**
 over 30 minutes through a separate official Beszel 0.21.0 hub. This verifies the
-agent-to-hub realtime data path; a rendered frontend chart screenshot was not
-captured. Fifteen idle minutes preceded controlled Plex transcodes and return
+agent-to-hub realtime data path. The follow-up captured rendered power and VRAM
+charts; see [feature verification](08-feature-verification.md). Fifteen idle minutes preceded controlled Plex transcodes and return
 to idle. Source was 4K HEVC Main10 HDR/DoVi, output H.264 1080p; VAAPI decode and
 encode plus the hardware pipeline were confirmed. Mean card power rose from
 30.38 W idle to 61.05 W under the sustained stream, returning to 30.44 W.
@@ -52,17 +52,18 @@ its `release/` directory. No production Plex token is part of the evidence.
 ## Separate work and limits
 
 - `fix/gpu-package-power-rollup`, **a69cee2c**: independent, tested historical
-  package-power aggregation fix. Not deployed to the official lab hub.
-- `feat/intel-xe-observability`, **a81dc7cd**: collector-side debug diagnostic
+  package-power aggregation fix. Deployed to a separate patched Mac lab hub in the follow-up; 10m/20m records verified.
+- `feat/intel-xe-observability`, **1b1b7053**: collector-side debug diagnostic
   prototype; actual/requested frequency and throttle status stay per tile/GT.
   Normal logging adds no frequency reads. No hub schema/frontend changes.
-- `feat/intel-sysfs-suspend-aware`, **2c65b04ff769**: explicit opt-in experimental PM mode,
+- `feat/intel-sysfs-suspend-aware`, **fe47c9b8**: explicit opt-in experimental PM mode,
   developed and reviewed separately; final source and hardware status below.
-- `experiment/xe-drm-telemetry`, **9035e5c4**: standalone bounded probes.
+- `experiment/xe-drm-telemetry`, **e69b61c9**: standalone bounded probes.
   Read-only render mapping with no capabilities returned 10666115072 usable
-  VRAM bytes. Global used VRAM and complete utilization are not integrated:
-  used memory is privilege restricted and the normal lab cannot see Plex's
-  processes. Per-client cycles are not global utilization.
+  VRAM bytes. The ioctl used-memory field is privilege restricted. A separate default-off
+  debugfs workaround now supplies global allocated VRAM on this kernel. Scoped
+  fdinfo binds verified per-client engine/memory observations without host PID;
+  complete device utilization remains unavailable.
 
 This kernel exposes no Intel temperature sensor. A380 hardware is unavailable.
 Legacy wire/UI zero/missing-value limitations remain; unsupported utilization
@@ -103,6 +104,28 @@ Optional PM image 2c65b04ff769 produced 60/60 power updates while active; its
 combined debug profile produced 30/30. Both GT diagnostic values matched direct
 sysfs. A later thermal reason flag was asserted without a temperature sensor;
 see the benchmark caveat rather than interpreting it as proven overheating.
-Sleep avoidance/savings, long-term optional-mode stability, A380 behavior and
+Sleep avoidance/savings, A380 behavior and
 complete utilization remain unverified. Production Plex token caches used by
 this task were removed after testing; dedicated lab credentials remain private.
+
+## Follow-up verification, 2026-10-20
+
+See [each feature and workaround](08-feature-verification.md). The optional PM
+profile ran for 30 minutes: 1801 active-only PM observations; 1450 canonical
+realtime updates with no GPU omissions; mean CPU 0.1542% of one core, 12.45–16.62
+MiB container memory. Controlled VAAPI transcoding raised card/package power
+from 30.42/15.91 W to 59.69/37.37 W. It returned to idle afterward. The lab-stopped
+PM-only baseline was also always active; no sleep or power-saving claim follows.
+
+`feat/intel-xe-debugfs-memory` adds an optional bounded reader of existing
+root-readable debugfs TTM allocation counters, using existing memory fields.
+No additional privileges/mounts are required here. Directory pinning prevents
+DRM minor reuse from redirecting reads. The combined lab branch is for testing;
+independent reviewable feature commits remain separate. Hardware verification confirmed 54.75 MiB idle → 1178.625 MiB transcode →
+54.75 MiB idle allocated VRAM. Existing graphs render these values. The combined
+profile used 0.25054% of one CPU core over five minutes with debug logging;
+no isolated cost or sleep-safety claim is made. See the feature report.
+
+Follow-up final state: core 4aadc51a7e6f restored, 20/20 post-restore updates
+verified, lab STOPPED again. Separate Mac hub runs patched a69cee2c with original
+hub/container backup retained. Production exact-state comparison passed again.

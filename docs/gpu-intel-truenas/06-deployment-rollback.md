@@ -64,3 +64,25 @@ Final rollback was tested again after experimental checks: restored the core
 image/configuration, verified ten realtime updates with power, then stopped only
 `beszel-intel-lab`. Final state STOPPED; managed volumes/images were retained.
 The Mac hub remains available; no production service was restarted or altered.
+
+## Follow-up isolated hub and optional memory profile
+
+The patched Mac lab hub is `beszel-intel-lab-hub:a69cee2c`, port18090, existing
+lab data volume. Original official hub container is retained stopped as
+`beszel-intel-lab-hub-original`. Before replacement, stop/copy backup volume
+`beszel-intel-lab-hub-backup-20261020-v2` was created; isolated writable copies
+of both SQLite databases passed quick_check. No migration was introduced.
+To revert the lab hub: stop/remove only the patched lab hub container, rename
+and start the retained original. It uses the same lab volume. Restore the
+coherent backup to a separate lab volume if recovery is required; never touch
+production data. Preserve the existing backup rather than overwriting it.
+
+Combined lab image 038cd368a7e5 was built from the same pinned official Intel
+base, replacing only /agent. Optional settings for that test:
+`INTEL_SYSFS_MODE=suspend-aware`, `INTEL_XE_DEBUGFS_MEMORY=true`, `LOG_LEVEL=debug`.
+No extra mounts/capabilities/devices/PID mode. Debugfs remains experimental and
+requires existing readability. Default Compose remains the core profile.
+TrueNAS app.update preserves STOPPED state; explicitly start only this lab if
+needed, then verify a fresh connection/readings before beginning measurements.
+The lab scope helper now permits optional memory selection; final rollback
+removes PM/debug/memory variables and restores core image before stopping it.

@@ -88,3 +88,26 @@ cp -R "$site_copy/dist/." internal/site/dist/
 
 No localization extraction ran in the source checkout; the temporary copy's
 compiled translations were not copied back. Dist output is ignored by Git.
+
+## Follow-up verified feature branches
+
+Combined source 038cd368a7e5, Go 1.27.2 Linux container, UID65534:
+
+```sh
+go test -tags='testing no_ui' ./...
+go vet ./agent/...
+go test -race -tags='testing no_ui' ./agent/...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-w -s' -o build/beszel-agent-linux-amd64 ./internal/cmd/agent
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o build/beszel-agent-darwin-arm64 ./internal/cmd/agent
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -tags='testing no_ui' -c -o build/beszel-intel-tests-linux-amd64 ./agent
+```
+
+All passed. Clean validation log: `verified-clean-validation.log`. An earlier
+attempt started while cherry-pick conflicts were unresolved; its interleaved
+log is excluded from evidence. The clean rerun occurred after resolution.
+TrueNAS executed the combined static binary's Intel sysfs/Xe/PM fixtures with
+`-test.run='TestIntelSysfs|TestIntelXe|TestSuspendAware' -test.timeout=60s`.
+PASS as UID65534, no devices/caps/network, private PID, readonly root and bounded
+tmpfs. This includes the deterministic pinned-minor reassignment regression.
+The standalone fdinfo PoC has seven passing Python tests; it is not bundled in
+the default agent image. Source/report crosslinks describe partial visibility.

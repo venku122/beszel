@@ -57,3 +57,15 @@ capacity=2. Plex's test transcode has two clients readable inside Plex's existin
 UID/namespace, not from the ordinary lab agent. No global utilization inference.
 The one-shot query took 78 microseconds on an already-active GPU; wakeups remain
 unmeasured. The temporary probe container was removed after its read-only run.
+
+## Follow-up capability refinement, 2026-10-20
+
+| Interface | Exists/readable | Privileges | Observable wakeup |
+| --- | --- | --- | --- |
+| Xe VRAM debugfs TTM manager | Yes through lab's existing read-only /sys | Existing root readability; CapEff=0, no added capability | Callback is software accounting; live GPU never suspended, so unproven |
+| Scoped known Plex fdinfo | Yes with one explicit RO target-directory bind and UID1000 | No added caps/host PID | Driver takes runtime PM reference; tested only under active transcode |
+| Global ioctl used VRAM | Not exposed to permitted query | Kernel perfmon capability check; not granted | Not used as a workaround |
+
+Debugfs reports allocated usable VRAM including driver allocations, distinct
+from per-client resident/shared bytes. Native query and debugfs agree on usable
+total: 10666115072 bytes. No Intel temperature/PMT interface was discovered.

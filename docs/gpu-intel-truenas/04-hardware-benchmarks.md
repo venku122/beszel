@@ -77,3 +77,12 @@ A 121-sample PM-only observer across the optional-mode/debug follow-up saw only
 active status, +120040 ms active and +0 ms suspended residency. The debug
 segment deliberately adds frequency reads and restarts the lab agent, so this
 window cannot quantify the PM-only mode's effect in isolation.
+
+## Follow-up extended PM and feature verification
+
+See [feature verification](08-feature-verification.md) for measured power, CPU,
+memory, PM residency, historical rollups, scoped engines and optional VRAM.
+Thirty-minute PM window: all active, no suspended residency. Mean CPU 0.15417%
+of one core; container memory 12.45–16.62 MiB and ended below starting memory.
+These are observed absolute values, not a controlled isolated cost estimate.
+No production collector/application was disabled to isolate sleep.
