@@ -28,6 +28,14 @@ type intelSysfsEnergySnapshot struct {
 	timestamp   time.Time
 }
 
+type intelSysfsSampleStatus uint8
+
+const (
+	intelSysfsFailed intelSysfsSampleStatus = iota
+	intelSysfsPriming
+	intelSysfsMeasured
+)
+
 type intelSysfsCard struct {
 	cardPath string
 	hwmonDir string
@@ -91,7 +99,11 @@ func (gm *GPUManager) pollIntelSysfs() bool {
 	}
 	cards, err := discoverIntelSysfsCards()
 	if err != nil {
+		gm.reportIntelSysfsHealth("", intelSysfsFailed, time.Now())
 		return false
+	}
+	if len(cards) == 0 {
+		gm.reportIntelSysfsHealth("", intelSysfsFailed, time.Now())
 	}
 	seen := make(map[string]bool, len(cards))
 	hasData := false
@@ -106,8 +118,19 @@ func (gm *GPUManager) pollIntelSysfs() bool {
 		if id == "" {
 			continue
 		}
+		if seen[id] {
+			continue
+		}
 		seen[id] = true
-		if gm.updateIntelSysfsGpuData(card.cardPath, card.hwmonDir) {
+		status := gm.sampleIntelSysfsGpuData(card.cardPath, card.hwmonDir)
+		if gm.intelSysfsStopped() {
+			return false
+		}
+		gm.reportIntelSysfsHealth(id, status, time.Now())
+		if status == intelSysfsMeasured {
+			gm.reportIntelSysfsHealth("", status, time.Now())
+		}
+		if status != intelSysfsFailed {
 			hasData = true
 		}
 	}
@@ -188,17 +211,22 @@ func findIntelEnergyHwmon(devicePath string) string {
 }
 
 func sysfsFileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // updateIntelSysfsGpuData reads GPU metrics from sysfs and updates the GPU data map.
-// Returns true if the required energy counter was read successfully.
+// Returns true for initial/recovery priming or a valid measured interval.
+// Rejected intervals are failures; priming never emits measured zero.
 func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
+	return gm.sampleIntelSysfsGpuData(cardPath, hwmonDir) != intelSysfsFailed
+}
+
+func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSysfsSampleStatus {
 	// All filesystem operations, including metadata and optional sensors, occur
 	// outside the manager lock. A kernel-stalled read must not freeze hub stats.
 	if gm.intelSysfsStopped() {
-		return false
+		return intelSysfsFailed
 	}
 	started := time.Now()
 	devicePath := filepath.Join(cardPath, "device")
@@ -221,20 +249,20 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 	// Reject a path reassigned during sampling. Revalidation also stays outside
 	// the mutex, and stopped collectors can never commit late sensor results.
 	if device != intelSysfsDevice(cardPath) {
-		return false
+		return intelSysfsFailed
 	}
 	afterSensor, err := filepath.EvalSymlinks(hwmonDir)
 	if err == nil && afterSensor != sensorPath {
-		return false
+		return intelSysfsFailed
 	}
 	gm.Lock()
 	defer gm.Unlock()
 	if gm.collectorStopped || time.Since(started) > 10*time.Second {
-		return false
+		return intelSysfsFailed
 	}
 	id := gm.intelSysfsID(cardPath, device)
 	if id == "" {
-		return false
+		return intelSysfsFailed
 	}
 	if gm.intelSysfsSensorPaths == nil {
 		gm.intelSysfsSensorPaths = make(map[string]string)
@@ -264,9 +292,10 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 				delete(gm.intelSysfsEnergySnapshots, key)
 			}
 		}
-		return false
+		return intelSysfsFailed
 	}
 
+	previous, hadBaseline := gm.intelSysfsEnergySnapshots[id]
 	power, hasPower := gm.calculateIntelSysfsPower(id, energy, now)
 	powerPkg, hasPowerPkg := gm.calculateIntelSysfsPackagePower(id, pkgPath, pkgEnergy, pkgErr, now)
 
@@ -310,7 +339,13 @@ func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
 		gpu.Count++
 		gm.intelSysfsSamples[id] = observed
 	}
-	return true
+	if hasPower {
+		return intelSysfsMeasured
+	}
+	if !hadBaseline || now.Sub(previous.timestamp) > 15*time.Second {
+		return intelSysfsPriming
+	}
+	return intelSysfsFailed
 }
 
 func (gm *GPUManager) calculateIntelSysfsPower(cardID string, microjoules uint64, timestamp time.Time) (float64, bool) {
@@ -504,4 +539,34 @@ func (gm *GPUManager) intelSysfsStopped() bool {
 	gm.Lock()
 	defer gm.Unlock()
 	return gm.collectorStopped
+}
+
+// At most one health entry per bounded stable identity plus the discovery entry.
+// Log outside the manager lock; warn on first failure and at most once a minute,
+// and only report recovery after an actual valid interval (never just priming).
+func (gm *GPUManager) reportIntelSysfsHealth(id string, status intelSysfsSampleStatus, now time.Time) {
+	gm.Lock()
+	if gm.collectorStopped {
+		gm.Unlock()
+		return
+	}
+	last, failed := gm.intelSysfsFailures[id]
+	warn := status == intelSysfsFailed && (!failed || now.Sub(last) >= time.Minute)
+	recovered := status == intelSysfsMeasured && failed
+	if warn {
+		if gm.intelSysfsFailures == nil {
+			gm.intelSysfsFailures = make(map[string]time.Time)
+		}
+		gm.intelSysfsFailures[id] = now
+	}
+	if recovered {
+		delete(gm.intelSysfsFailures, id)
+	}
+	gm.Unlock()
+	if warn {
+		slog.Warn("Intel sysfs power unavailable", "card", id, "state", "failed", "reason", "no usable power sample")
+	}
+	if recovered {
+		slog.Info("Intel sysfs power recovered", "card", id, "state", "recovered")
+	}
 }

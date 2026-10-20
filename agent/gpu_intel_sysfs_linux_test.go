@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -331,14 +333,14 @@ func TestIntelSysfsPackageMissingDoesNotDilutePower(t *testing.T) {
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "newly reappeared counter needs a baseline")
 }
 
-func TestIntelSysfsDiscoveryDoesNotOpenSensor(t *testing.T) {
+func TestIntelSysfsDiscoveryRejectsDirectory(t *testing.T) {
 	_, card, hwmon := setupIntelSysfsTest(t)
 	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
-	// Stat of a directory succeeds, but reading it as an energy file fails.
+	// Metadata-only discovery must reject a non-file attribute.
 	require.NoError(t, os.Mkdir(filepath.Join(hwmon, "energy1_input"), 0755))
 	cards, err := discoverIntelSysfsCards()
 	require.NoError(t, err)
-	require.Len(t, cards, 1)
+	require.Empty(t, cards)
 }
 
 func TestIntelSysfsCancellation(t *testing.T) {
@@ -643,4 +645,80 @@ func TestIntelSysfsShutdownDoesNotVisitNextBlockedCard(t *testing.T) {
 		<-gm.collectorDone
 		t.Fatal("cancelled collector visited second blocking sensor")
 	}
+}
+
+func TestIntelSysfsInvalidIntervalIsNotSuccessfulSampling(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon), "initial baseline is healthy priming")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000000000")
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	require.False(t, gm.updateIntelSysfsGpuData(card, hwmon), "rejected spike is failed sampling")
+	require.Empty(t, gm.GetCurrentData(1))
+	// A slow recovery probe must re-prime instead of remaining stuck in backoff.
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000003000000")
+	setIntelSysfsTime(t, time.Unix(163, 0))
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.Empty(t, gm.GetCurrentData(1))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000006000000")
+	setIntelSysfsTime(t, time.Unix(166, 0))
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.Equal(t, 1.0, gm.GetCurrentData(1)["card0"].Power)
+}
+
+func TestIntelSysfsFailureWarningsAndRecovery(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
+	var log bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&log, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "NaN")
+	for range 20 {
+		require.False(t, gm.pollIntelSysfs())
+	}
+	require.Equal(t, 1, strings.Count(log.String(), "level=WARN"), "persistent failure logs must be rate limited")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	gm.pollIntelSysfs()
+	require.NotContains(t, log.String(), "recovered", "priming is not measured recovery")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "31000000")
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	gm.pollIntelSysfs()
+	require.Equal(t, 1, strings.Count(log.String(), "Intel sysfs power recovered"))
+}
+
+func TestIntelSysfsWarningIntervalAndRecoveryState(t *testing.T) {
+	var log bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&log, nil)))
+	defer slog.SetDefault(old)
+	gm := &GPUManager{}
+	now := time.Now()
+	gm.reportIntelSysfsHealth("card0", intelSysfsFailed, now)
+	gm.reportIntelSysfsHealth("card0", intelSysfsFailed, now.Add(59*time.Second))
+	require.Equal(t, 1, strings.Count(log.String(), "level=WARN"))
+	gm.reportIntelSysfsHealth("card0", intelSysfsFailed, now.Add(time.Minute))
+	require.Equal(t, 2, strings.Count(log.String(), "level=WARN"))
+	gm.reportIntelSysfsHealth("card0", intelSysfsPriming, now.Add(61*time.Second))
+	require.NotContains(t, log.String(), "recovered")
+	gm.reportIntelSysfsHealth("card0", intelSysfsMeasured, now.Add(64*time.Second))
+	require.Equal(t, 1, strings.Count(log.String(), "Intel sysfs power recovered"))
+}
+func TestIntelSysfsUnreadableCandidateIsNotHealthy(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read permissionless fixtures")
+	}
+	_, card, hwmon := setupIntelSysfsTest(t)
+	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
+	path := filepath.Join(hwmon, "energy1_input")
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	require.NoError(t, os.Chmod(path, 0000))
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	require.True(t, gm.hasIntelSysfs(), "startup discovers regular metadata without opening sensors")
+	require.False(t, gm.pollIntelSysfs())
+	require.Empty(t, gm.GetCurrentData(1))
 }

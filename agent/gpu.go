@@ -53,6 +53,7 @@ type GPUManager struct {
 	intelSysfsEnergySnapshots map[string]intelSysfsEnergySnapshot
 	intelSysfsIDs             map[string]string
 	intelSysfsNames           map[string]string
+	intelSysfsFailures        map[string]time.Time
 	intelSysfsSensorPaths     map[string]string
 	// Internal sysfs freshness; never serialized. Access under the manager mutex.
 	intelSysfsSamples       map[string]time.Time
