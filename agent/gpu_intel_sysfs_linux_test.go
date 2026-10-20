@@ -718,7 +718,7 @@ func TestIntelSysfsUnreadableCandidateIsNotHealthy(t *testing.T) {
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	require.NoError(t, os.Chmod(path, 0000))
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
-	require.True(t, gm.hasIntelSysfs(), "startup discovers regular metadata without opening sensors")
+	require.False(t, gm.hasIntelSysfs(), "metadata permission checks must reject an unreadable candidate without opening it")
 	require.False(t, gm.pollIntelSysfs())
 	require.Empty(t, gm.GetCurrentData(1))
 }

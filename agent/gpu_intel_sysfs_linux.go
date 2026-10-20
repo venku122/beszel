@@ -16,6 +16,7 @@ import (
 
 	"github.com/henrygd/beszel/agent/utils"
 	"github.com/henrygd/beszel/internal/entities/system"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -212,7 +213,9 @@ func findIntelEnergyHwmon(devicePath string) string {
 
 func sysfsFileExists(path string) bool {
 	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
+	// Permission checks inspect inode metadata; they do not open the hwmon
+	// attribute or call its sensor read callback. Actual sampling can still fail.
+	return err == nil && info.Mode().IsRegular() && unix.Faccessat(unix.AT_FDCWD, path, unix.R_OK, unix.AT_EACCESS) == nil
 }
 
 // updateIntelSysfsGpuData reads GPU metrics from sysfs and updates the GPU data map.
