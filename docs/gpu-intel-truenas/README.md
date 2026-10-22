@@ -62,11 +62,78 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-w -s' -o /tm
 
 Focused tests, race checks and the cross-build passed on Linux/ARM64; repeated
 regressions, the serialized full suite and vet passed on Linux/amd64. The final
-FIFO cleanup adjustment also passed the focused race suite. These corrections
-have **not** been deployed or tested on real hardware. The October 20 results
-below belong to source e89dbb63ae04, not this revised runtime. No TrueNAS or
-production services were changed during this pass. Existing kernel-blocked-read,
-sleep-state and wire/UI availability limitations remain.
+FIFO cleanup adjustment also passed the focused race suite. Hardware acceptance
+of this revised runtime is recorded below; the separate October 20 results
+remain attributed to e89dbb63ae04. Existing kernel-blocked-read, sleep-state and
+wire/UI availability limitations remain.
+
+## Final corrective hardware acceptance — 2026-10-21
+
+Tested runtime source **c455ea09a860da627aac4e832d89067ba5371d11**, image
+`beszel-intel-lab:c455ea09a860`, deployed binary SHA256
+`d340ea10fa54a8fab4912fc7d423f3758c094e5859ac31df87f487ab82027bc3`.
+The immutable build's provenance and deployed executable hashes matched.
+Subsequent additions change tests/documentation only. TrueNAS remained on
+Linux 6.12.33 with Xe B570 and AMD Cezanne; the existing Mac lab hub remained
+on its separate a69cee2c build. No upstream hub or production app was deployed.
+
+With `GPU_COLLECTOR=amd_sysfs,intel_sysfs`, all **900/900** one-second realtime
+observations over 15 minutes contained both GPUs and Intel card/package power.
+The maximum update gap was **1.126 s**. All **15/15** historical one-minute
+records created within the capture also retained both GPUs and both Intel power
+fields. A fresh subscription after a managed lab stop/start delivered **30/30**
+updates with the same fields.
+
+| Phase | Updates | Mean Intel card W | Mean package W |
+| --- | ---: | ---: | ---: |
+| Idle, five minutes | 301 | 30.412 | 15.920 |
+| Controlled transcode | 183 | 60.801 | 37.974 |
+| Return to idle, including load tail | 416 | 30.609 | 16.059 |
+
+The dedicated stream stopped normally after 182.9 s /146 HLS segments. The
+selected source was 4K HEVC Main10 HDR/DoVi; Plex reported VAAPI decode/encode
+and full hardware pipeline. The matching session command confirmed H.264 VAAPI
+encoding and 1920x1080 scaling. No existing Plex session was present when the
+test began. Power remains driver-derived, not externally calibrated.
+
+Container CPU averaged **0.18057% of one core** over 890.6 s of resource samples.
+Memory was **13.74–16.89 MiB**, first 13.74/last 16.16 MiB; PID/thread count
+stayed **21**, process descriptors **6→6**, and process disk write_bytes **0→0**.
+There were no restarts and no GPU warning/error lines (four total log lines,
+4096-line capture bound). Versus the October 20 run, CPU differs by **+0.00590
+percentage points** and peak memory by **+1.61 MiB**. These are not controlled
+A/B results: duration, workload fractions, cold state and snapshot commands
+differ. This short run does not establish indefinite leak freedom or a causal
+resource regression.
+
+The stopped-lab baseline had 721 PM observations over 180 s; the running capture
+had 901 over 900 s. Both stayed active throughout, respectively adding 180000
+and 900000 ms active residency and zero suspended residency. Other GPU clients
+were untouched. Sleep preservation and polling-induced wakeups remain unproven.
+A380, live GPU reset and Intel temperature availability remain unverified or
+unsupported as previously documented.
+
+All **52 selected Intel fixture parent/subtest entries** also passed on TrueNAS
+as UID65534 in a container with no network/devices/capabilities, read-only root
+and bounded tmpfs. Fixtures cover the unavailable final package sample,
+disappearing hwmon directory, recovery and blocked optional reads without
+resetting the live GPU. Supplemental tests verify actual collector output
+through CBOR/production response decoding/JSON, and synthetic valid/unavailable
+package values through production decoding and real hub database persistence.
+These complementary checks do not inject a failed sensor into the live stream
+or exercise tier rollups. Focused tests/race checks and the Linux/amd64 full
+serialized suite passed; Linux ARM64 and Darwin ARM64 agent cross-builds passed.
+
+The final managed lab stop completed in **2.48 s** (app operation, not a kernel
+syscall cancellation measurement). The verifier initially expected a retained
+stopped container; TrueNAS removes it, and the verifier was corrected to accept
+that managed lifecycle. Lab configuration returned to Intel-only on the new
+image and remained **STOPPED**. Production Plex/Beszel container IDs, images,
+states, start times and restart counts matched the preflight snapshot. No Plex
+sessions or probe containers remained; temporary Plex credential files were
+removed. The prior lab configuration is retained privately for rollback.
+Sanitized measurements, build provenance, the test-only patch and fixture binary
+hash stay outside Git under `artifacts/beszel-intel-v2/acceptance-2026-10-21/`.
 
 ## Regression evidence
 

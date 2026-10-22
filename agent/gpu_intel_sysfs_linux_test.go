@@ -4,6 +4,11 @@ package agent
 
 import (
 	"bytes"
+	"encoding/json"
+	jsonv2 "encoding/json/v2"
+	"github.com/fxamacker/cbor/v2"
+	"github.com/henrygd/beszel/internal/common"
+	"github.com/henrygd/beszel/internal/hub/transport"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -775,7 +780,41 @@ func TestIntelSysfsPackageAvailabilityPerConsumer(t *testing.T) {
 	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "realtime has consumed the earlier valid package sample")
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg)
-	require.Equal(t, 16.0, gm.GetCurrentData(60)["card0"].PowerPkg, "historical interval still contains one valid package sample")
+	historical := gm.GetCurrentData(60)
+	require.Equal(t, 16.0, historical["card0"].PowerPkg, "historical interval still contains one valid package sample")
+	// Exercise the actual collector output through the agent envelope and the
+	// JSON representation consumed by hub records/realtime clients.
+	for _, tc := range []struct {
+		name        string
+		data        map[string]system.GPUData
+		wantPackage bool
+	}{
+		{"historical", historical, true},
+		{"realtime unavailable", gm.GetCurrentData(1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := cbor.Marshal(system.CombinedData{Stats: system.Stats{GPUData: tc.data}})
+			require.NoError(t, err)
+			wire, err := cbor.Marshal(common.AgentResponse{Data: payload})
+			require.NoError(t, err)
+			var response common.AgentResponse
+			require.NoError(t, cbor.Unmarshal(wire, &response))
+			var decoded system.CombinedData
+			require.NoError(t, transport.UnmarshalResponse(response, common.GetData, &decoded))
+			encoded, err := jsonv2.Marshal(decoded.Stats)
+			require.NoError(t, err)
+			var result struct {
+				GPU map[string]map[string]any `json:"g"`
+			}
+			require.NoError(t, json.Unmarshal(encoded, &result))
+			require.Equal(t, 30.0, result.GPU["card0"]["p"])
+			if tc.wantPackage {
+				require.Equal(t, 16.0, result.GPU["card0"]["pp"])
+			} else {
+				require.NotContains(t, result.GPU["card0"], "pp")
+			}
+		})
+	}
 	require.Zero(t, gm.GetCurrentData(60)["card0"].PowerPkg, "do not carry package power when the latest sample is unavailable")
 }
 
