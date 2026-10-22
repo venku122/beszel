@@ -335,9 +335,6 @@ func (gm *GPUManager) GetCurrentData(cacheKey uint16) map[string]system.GPUData 
 			continue
 		}
 		gpuAvg := gm.calculateGPUAverage(id, gpu, cacheKey)
-		if _, sysfs := gm.intelSysfsSamples[id]; sysfs && !gm.intelSysfsPackageValid[id] {
-			gpuAvg.PowerPkg = 0
-		}
 		gm.updateInstantaneousValues(&gpuAvg, gpu)
 		gm.storeSnapshot(id, gpu, cacheKey)
 		gm.lastSnapshots[cacheKey][id].average = gpuAvg
@@ -383,7 +380,13 @@ func (gm *GPUManager) calculateGPUAverage(id string, gpu *system.GPUData, cacheK
 	// If no new data arrived
 	if deltaCount == 0 {
 		if _, sysfs := gm.intelSysfsSamples[id]; sysfs && lastSnapshot != nil {
-			return lastSnapshot.average
+			average := lastSnapshot.average
+			// Carry fresh realtime values between polls, but never carry package
+			// power past an unavailable sample. New intervals use their own count.
+			if !gm.intelSysfsPackageValid[id] {
+				average.PowerPkg = 0
+			}
+			return average
 		}
 		// Only discrete GPUs report temp/memory, so treat all-zero as suspended (return zeros).
 		// Engine-based (Intel) GPUs don't, so carry the last average forward across sample gaps.

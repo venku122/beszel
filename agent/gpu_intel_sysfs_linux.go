@@ -236,12 +236,15 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	device := intelSysfsDevice(cardPath)
 	sensorPath, sensorErr := filepath.EvalSymlinks(hwmonDir)
 	if sensorErr != nil {
-		sensorPath = hwmonDir
+		return gm.rejectIntelSysfsSample(cardPath, device)
 	}
-	name := getIntelSysfsGpuName(cardPath)
 	energy, energyErr := readSysfsUint(filepath.Join(hwmonDir, "energy1_input"))
+	if energyErr != nil {
+		return gm.rejectIntelSysfsSample(cardPath, device)
+	}
 	observed := time.Now()
 	now := intelSysfsNow()
+	name := getIntelSysfsGpuName(cardPath)
 	pkgPath, pkgEnergy, pkgErr := readIntelSysfsPackageCounter(hwmonDir)
 	pkgNow := now
 	if pkgErr == nil {
@@ -256,11 +259,11 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	// Reject a path reassigned during sampling. Revalidation also stays outside
 	// the mutex, and stopped collectors can never commit late sensor results.
 	if device != intelSysfsDevice(cardPath) {
-		return intelSysfsFailed
+		return gm.rejectIntelSysfsSample(cardPath, device)
 	}
 	afterSensor, err := filepath.EvalSymlinks(hwmonDir)
-	if err == nil && afterSensor != sensorPath {
-		return intelSysfsFailed
+	if err != nil || afterSensor != sensorPath {
+		return gm.rejectIntelSysfsSample(cardPath, device)
 	}
 	gm.Lock()
 	defer gm.Unlock()
@@ -290,17 +293,6 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	}
 	gm.intelSysfsSamples[id] = time.Time{}
 	gm.intelSysfsPackageValid[id] = false
-
-	if energyErr != nil {
-		delete(gm.intelSysfsEnergySnapshots, id)
-		// No interval may bridge an unreadable counter.
-		for key := range gm.intelSysfsEnergySnapshots {
-			if strings.HasPrefix(key, id+":") {
-				delete(gm.intelSysfsEnergySnapshots, key)
-			}
-		}
-		return intelSysfsFailed
-	}
 
 	previous, hadBaseline := gm.intelSysfsEnergySnapshots[id]
 	power, hasPower := gm.calculateIntelSysfsPower(id, energy, now)
@@ -351,6 +343,31 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	}
 	if !hadBaseline || now.Sub(previous.timestamp) > 15*time.Second {
 		return intelSysfsPriming
+	}
+	return intelSysfsFailed
+}
+
+// rejectIntelSysfsSample invalidates baselines without accessing the filesystem.
+// Neither unreadable counters nor removed sensors may bridge a recovery interval.
+func (gm *GPUManager) rejectIntelSysfsSample(cardPath, device string) intelSysfsSampleStatus {
+	gm.Lock()
+	defer gm.Unlock()
+	if gm.collectorStopped {
+		return intelSysfsFailed
+	}
+	id := gm.intelSysfsID(cardPath, device)
+	if id == "" {
+		return intelSysfsFailed
+	}
+	delete(gm.intelSysfsEnergySnapshots, id)
+	for key := range gm.intelSysfsEnergySnapshots {
+		if strings.HasPrefix(key, id+":") {
+			delete(gm.intelSysfsEnergySnapshots, key)
+		}
+	}
+	if gm.intelSysfsSamples != nil {
+		gm.intelSysfsSamples[id] = time.Time{}
+		gm.intelSysfsPackageValid[id] = false
 	}
 	return intelSysfsFailed
 }

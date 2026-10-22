@@ -30,6 +30,44 @@ Those reports describe additional feature branches not included in this PR.
   are recorded in image labels and build/*.provenance.json. Existing binaries
   are never trusted; dirty trees and compile failures stop the workflow.
 
+## Second review corrections — 2026-10-21
+
+- Package-power availability now follows the valid package count in each
+  consumer's interval. A missing final package reading no longer discards
+  earlier valid historical measurements. Realtime carry still clears package
+  power after an unavailable sample; unavailable intervals never dilute averages.
+- Failed hwmon path revalidation rejects the sample, including ENOENT during
+  removal. Rejected reads clear freshness and counter baselines, so a recreated
+  sensor must prime before reporting power.
+- Primary energy failures invalidate baselines immediately and skip optional
+  package, temperature, utilization, memory and name reads.
+
+The new regressions failed against 9b0a076 before implementation: historical
+package power was zero, removed hwmon readings committed, and primary failure
+blocked on an optional FIFO. Corrected regressions passed 20 repetitions on
+Linux/amd64. Independent review found no production-code blocker and identified
+one FIFO fixture cleanup race, corrected with bounded rendezvous and worker
+completion checks.
+
+Fresh Go 1.27.2 container checks (UID65534):
+
+```sh
+go test -tags='testing no_ui' ./agent -run 'TestIntelSysfs|TestGPU' -count=1 -timeout=90s
+go test -tags='testing no_ui' ./agent -run 'TestIntelSysfs(PackageMissing|PackageAvailability|DisappearingHwmon|PrimaryFailure)' -count=20 -timeout=60s
+go test -p 1 -count=1 -tags='testing no_ui' ./...
+go vet ./agent/...
+go test -race -count=1 -tags='testing no_ui' ./agent/...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-w -s' -o /tmp/beszel-agent-second-review ./internal/cmd/agent
+```
+
+Focused tests, race checks and the cross-build passed on Linux/ARM64; repeated
+regressions, the serialized full suite and vet passed on Linux/amd64. The final
+FIFO cleanup adjustment also passed the focused race suite. These corrections
+have **not** been deployed or tested on real hardware. The October 20 results
+below belong to source e89dbb63ae04, not this revised runtime. No TrueNAS or
+production services were changed during this pass. Existing kernel-blocked-read,
+sleep-state and wire/UI availability limitations remain.
+
 ## Regression evidence
 
 The new FIFO fixtures first reproduced hub mutex stalls and shutdown waits on
@@ -89,9 +127,10 @@ before starting a measurement. Large logs, images and binaries remain outside Gi
 Tested source **e89dbb63ae04a130b251bd3897700aef3fb681b5**, incorporating upstream
 **0fb738de**. Image `beszel-intel-lab:e89dbb63ae04`; actual deployed /agent SHA256
 `99191d040afe8059b7878eecd62ba36b8abaa1bacfd78245a71309164dcb547e` matches
-both the image label and provenance manifest. Later documentation/lock-comment
-edits do not change the tested runtime implementation. No experimental telemetry
-code was added. Older experimental branches need rebasing onto this corrected core.
+both the image label and provenance manifest. Through 9b0a076, later
+edits changed only documentation/lock comments. The October 21 corrections above
+change runtime behavior and have fixture validation only. No experimental
+telemetry code was added. Older experimental branches need rebasing onto this corrected core.
 
 With `GPU_COLLECTOR=amd_sysfs,intel_sysfs`, **1800/1800** one-second observations
 contained both AMD Cezanne and Intel B570. No Intel card/package power fields

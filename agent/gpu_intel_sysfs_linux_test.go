@@ -330,7 +330,7 @@ func TestIntelSysfsPackageMissingDoesNotDilutePower(t *testing.T) {
 		}
 		require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
 	}
-	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "newly reappeared counter needs a baseline")
+	require.Equal(t, 5.0, gm.GetCurrentData(1)["card0"].PowerPkg, "keep the earlier valid package interval; a reappeared counter only primes")
 }
 
 func TestIntelSysfsDiscoveryRejectsDirectory(t *testing.T) {
@@ -750,4 +750,123 @@ func TestIntelSysfsSlowPackageAcquisitionIsUnavailable(t *testing.T) {
 	require.NoError(t, unix.Close(fd))
 	require.True(t, <-done, "card interval remains valid")
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "slow package acquisition must be unavailable, not a spike")
+}
+
+// A failed final package sample must not erase measurements in a slower
+// consumer's window, or leak the previous window into realtime updates.
+func TestIntelSysfsPackageAvailabilityPerConsumer(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	for i := 0; i < 3; i++ {
+		setIntelSysfsTime(t, time.Unix(int64(100+i*3), 0))
+		writeIntelSysfsFile(t, hwmon, "energy1_input", strconv.Itoa(1000000+i*90000000))
+		writeIntelSysfsFile(t, hwmon, "energy2_input", strconv.Itoa(1000000+i*48000000))
+		require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+		if i == 1 {
+			require.Equal(t, 16.0, gm.GetCurrentData(1)["card0"].PowerPkg)
+			require.Equal(t, 16.0, gm.GetCurrentData(60)["card0"].PowerPkg)
+		}
+	}
+	require.Equal(t, 16.0, gm.GetCurrentData(1)["card0"].PowerPkg)
+	require.Equal(t, 16.0, gm.GetCurrentData(1)["card0"].PowerPkg, "carry a fresh sample between polls")
+	require.NoError(t, os.Remove(filepath.Join(hwmon, "energy2_input")))
+	setIntelSysfsTime(t, time.Unix(109, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "271000000")
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "realtime has consumed the earlier valid package sample")
+	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg)
+	require.Equal(t, 16.0, gm.GetCurrentData(60)["card0"].PowerPkg, "historical interval still contains one valid package sample")
+	require.Zero(t, gm.GetCurrentData(60)["card0"].PowerPkg, "do not carry package power when the latest sample is unavailable")
+}
+
+func TestIntelSysfsDisappearingHwmonRejectsSample(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	fifo := filepath.Join(hwmon, "temp1_input")
+	require.NoError(t, unix.Mkfifo(fifo, 0600))
+	done := make(chan intelSysfsSampleStatus, 1)
+	go func() { done <- gm.sampleIntelSysfsGpuData(card, hwmon) }()
+	fd := -1
+	require.Eventually(t, func() bool {
+		var err error
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		return err == nil
+	}, time.Second, time.Millisecond)
+	release := sync.OnceFunc(func() { require.NoError(t, unix.Close(fd)) })
+	defer release()
+	require.NoError(t, os.RemoveAll(hwmon))
+	release()
+	select {
+	case status := <-done:
+		require.Equal(t, intelSysfsFailed, status)
+		require.Zero(t, gm.GpuDataMap["card0"].Count, "removed sensor readings must not be committed")
+	case <-time.After(time.Second):
+		t.Fatal("sensor worker did not finish")
+	}
+	require.NoError(t, os.MkdirAll(hwmon, 0755))
+	setIntelSysfsTime(t, time.Unix(106, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "181000000")
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon), "recreated sensor needs a new baseline")
+	require.Empty(t, gm.GetCurrentData(1))
+	setIntelSysfsTime(t, time.Unix(109, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "271000000")
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Equal(t, 30.0, gm.GetCurrentData(1)["card0"].Power)
+}
+
+func TestIntelSysfsPrimaryFailureSkipsOptionalReads(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "invalid")
+	fifo := filepath.Join(hwmon, "temp1_input")
+	require.NoError(t, unix.Mkfifo(fifo, 0600))
+	done := make(chan intelSysfsSampleStatus, 1)
+	go func() {
+		done <- gm.sampleIntelSysfsGpuData(card, hwmon)
+		close(done)
+	}()
+	// If the assertion fails before the reader reaches open(), rendezvous
+	// with it later and release it before fixture/global-clock cleanup.
+	t.Cleanup(func() {
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				if fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+					assert.NoError(t, unix.Close(fd))
+				}
+			case <-deadline.C:
+				t.Error("optional sensor worker did not exit during cleanup")
+				return
+			}
+		}
+	})
+	select {
+	case status := <-done:
+		require.Equal(t, intelSysfsFailed, status)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("primary energy failure accessed a blocking optional sensor")
+	}
+	require.NoError(t, os.Remove(fifo))
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Empty(t, gm.GetCurrentData(1), "recovery must prime rather than bridge the failed interval")
+	setIntelSysfsTime(t, time.Unix(106, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "181000000")
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Equal(t, 30.0, gm.GetCurrentData(1)["card0"].Power)
 }
