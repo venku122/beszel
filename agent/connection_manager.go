@@ -237,6 +237,9 @@ func (c *ConnectionManager) handleSSHChange() {
 func (c *ConnectionManager) stop() error {
 	_ = c.agent.StopServer()
 	c.agent.monitorManager.Stop()
+	if c.agent.gpuManager != nil {
+		c.agent.gpuManager.stopCollectors()
+	}
 	c.closeWebSocket()
 	c.agent.cleanupSensorShadow()
 	return health.CleanUp()
