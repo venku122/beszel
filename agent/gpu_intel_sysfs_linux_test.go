@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/henrygd/beszel/agent/utils"
 	"github.com/henrygd/beszel/internal/entities/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,8 +101,8 @@ func TestIntelSysfsFirstSampleInitializesWithoutBogusPower(t *testing.T) {
 	setIntelSysfsTime(t, time.Unix(100, 0))
 
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
-	ok := gm.updateIntelSysfsGpuData(cardPath, hwmonPath)
-	require.True(t, ok)
+	status := gm.sampleIntelSysfsGpuData(cardPath, hwmonPath)
+	require.Equal(t, intelSysfsPriming, status)
 
 	gpu := gm.GpuDataMap["card0"]
 	require.NotNil(t, gpu)
@@ -122,11 +121,11 @@ func TestIntelSysfsSecondSampleComputesWatts(t *testing.T) {
 	oldNow := intelSysfsNow
 	intelSysfsNow = func() time.Time { return time.Unix(100, 0) }
 	t.Cleanup(func() { intelSysfsNow = oldNow })
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(cardPath, hwmonPath))
 
 	writeIntelSysfsFile(t, hwmonPath, "energy1_input", "6000000\n")
 	intelSysfsNow = func() time.Time { return time.Unix(102, 0) }
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(cardPath, hwmonPath))
 
 	gpu := gm.GpuDataMap["card0"]
 	require.NotNil(t, gpu)
@@ -145,12 +144,12 @@ func TestIntelSysfsSecondEnergyCounterMapsToPowerPkg(t *testing.T) {
 	t.Cleanup(func() { intelSysfsNow = oldNow })
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	intelSysfsNow = func() time.Time { return time.Unix(100, 0) }
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(cardPath, hwmonPath))
 
 	writeIntelSysfsFile(t, hwmonPath, "energy1_input", "2000000\n")
 	writeIntelSysfsFile(t, hwmonPath, "energy2_input", "8000000\n")
 	intelSysfsNow = func() time.Time { return time.Unix(102, 0) }
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(cardPath, hwmonPath))
 
 	gpu := gm.GpuDataMap["card0"]
 	require.NotNil(t, gpu)
@@ -173,92 +172,54 @@ func TestIntelSysfsCounterResetSkipsOneSample(t *testing.T) {
 	assert.Equal(t, 1.0, power)
 }
 
-func TestIntelSysfsTempInputMapsToCelsius(t *testing.T) {
-	_, cardPath, hwmonPath := setupIntelSysfsTest(t)
-	devicePath := filepath.Join(cardPath, "device")
-	writeIntelSysfsFile(t, devicePath, "vendor", "0x8086\n")
-	writeIntelSysfsFile(t, hwmonPath, "energy1_input", "1000000\n")
-	writeIntelSysfsFile(t, hwmonPath, "temp1_input", "43500\n")
-	setIntelSysfsTime(t, time.Unix(100, 0))
-
+func TestIntelSysfsMissingPackageCounterDoesNotFail(t *testing.T) {
+	_, card, hwmon := setupIntelSysfsTest(t)
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
-
-	gpu := gm.GpuDataMap["card0"]
-	require.NotNil(t, gpu)
-	assert.Equal(t, 43.5, gpu.Temperature)
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon))
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	data := gm.GetCurrentData(1)["card0"]
+	require.Equal(t, 30.0, data.Power)
+	require.Zero(t, data.PowerPkg)
 }
 
-func TestIntelSysfsMissingOptionalFilesDoNotFail(t *testing.T) {
-	_, cardPath, hwmonPath := setupIntelSysfsTest(t)
-	devicePath := filepath.Join(cardPath, "device")
-	writeIntelSysfsFile(t, devicePath, "vendor", "0x8086\n")
-	writeIntelSysfsFile(t, hwmonPath, "energy1_input", "1000000\n")
-	setIntelSysfsTime(t, time.Unix(100, 0))
-
-	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
-
-	gpu := gm.GpuDataMap["card0"]
-	require.NotNil(t, gpu)
-	assert.Equal(t, 0.0, gpu.Usage)
-	assert.Equal(t, 0.0, gpu.MemoryUsed)
-	assert.Equal(t, 0.0, gpu.MemoryTotal)
-	assert.Equal(t, 0.0, gpu.Temperature)
-}
-
-func TestIntelSysfsMapsOpportunisticMemoryAndUsage(t *testing.T) {
-	_, cardPath, hwmonPath := setupIntelSysfsTest(t)
-	devicePath := filepath.Join(cardPath, "device")
-	writeIntelSysfsFile(t, devicePath, "vendor", "0x8086\n")
-	writeIntelSysfsFile(t, devicePath, "gpu_busy_percent", "37\n")
-	writeIntelSysfsFile(t, devicePath, "mem_info_lmem_used", "1073741824\n")
-	writeIntelSysfsFile(t, devicePath, "mem_info_lmem_total", "2147483648\n")
-	writeIntelSysfsFile(t, hwmonPath, "energy1_input", "1000000\n")
-	setIntelSysfsTime(t, time.Unix(100, 0))
-
-	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
-	require.True(t, gm.updateIntelSysfsGpuData(cardPath, hwmonPath))
-
-	gpu := gm.GpuDataMap["card0"]
-	require.NotNil(t, gpu)
-	assert.Equal(t, 0.0, gpu.Usage) // no valid interval yet
-	assert.Equal(t, utils.BytesToMegabytes(1073741824), gpu.MemoryUsed)
-	assert.Equal(t, utils.BytesToMegabytes(2147483648), gpu.MemoryTotal)
-}
-
-// A sysfs-only GPU has neither engine data, temperature nor memory on Xe.
 func TestIntelSysfsRealtimeContinuity(t *testing.T) {
 	_, card, hwmon := setupIntelSysfsTest(t)
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	setIntelSysfsTime(t, time.Unix(100, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	gm.GetCurrentData(1)
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "61000000")
 	setIntelSysfsTime(t, time.Unix(103, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	require.Equal(t, 20.0, gm.GetCurrentData(1)["card0"].Power)
 	require.Equal(t, 20.0, gm.GetCurrentData(1)["card0"].Power)
 }
 
 func TestIntelSysfsUnknownEnergyLabelIsNotPackage(t *testing.T) {
-	_, _, hwmon := setupIntelSysfsTest(t)
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy2_label", "memory")
-	gm := &GPUManager{}
-	gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(100, 0))
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon))
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "3000000")
-	_, ok := gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(102, 0))
-	require.False(t, ok)
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg)
 }
 
-func TestIntelSysfsRejectsInvalidOptionalNumbers(t *testing.T) {
+func TestIntelSysfsRejectsInvalidEnergyNumbers(t *testing.T) {
 	for _, value := range []string{"NaN", "+Inf", "-1", string(make([]byte, 100000))} {
 		t.Run(value[:min(len(value), 8)], func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "value")
 			require.NoError(t, os.WriteFile(path, []byte(value), 0600))
-			_, err := readOptionalSysfsFloat(path)
+			_, err := readSysfsUint(path)
 			require.Error(t, err)
 		})
 	}
@@ -333,7 +294,7 @@ func TestIntelSysfsPackageMissingDoesNotDilutePower(t *testing.T) {
 		} else {
 			writeIntelSysfsFile(t, hwmon, "energy2_input", strconv.Itoa(1000000+i*15000000))
 		}
-		require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+		require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	}
 	require.Equal(t, 5.0, gm.GetCurrentData(1)["card0"].PowerPkg, "keep the earlier valid package interval; a reappeared counter only primes")
 }
@@ -379,24 +340,31 @@ func TestIntelSysfsCardRenumberKeepsSeries(t *testing.T) {
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	setIntelSysfsTime(t, time.Unix(100, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(filepath.Join(root, "card0"), hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(filepath.Join(root, "card0"), hwmon))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "31000000")
 	setIntelSysfsTime(t, time.Unix(103, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(filepath.Join(root, "card2"), hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(filepath.Join(root, "card2"), hwmon))
 	require.Len(t, gm.GpuDataMap, 1)
 	require.Equal(t, 10.0, gm.GetCurrentData(1)["card0"].Power)
 }
 
 func TestIntelSysfsPackageSourceChangeNeedsBaseline(t *testing.T) {
-	_, _, hwmon := setupIntelSysfsTest(t)
-	gm := &GPUManager{}
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
-	gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(100, 0))
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon))
 	writeIntelSysfsFile(t, hwmon, "energy2_label", "memory")
 	writeIntelSysfsFile(t, hwmon, "energy3_label", "pkg")
 	writeIntelSysfsFile(t, hwmon, "energy3_input", "31000000")
-	_, ok := gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(103, 0))
-	require.False(t, ok, "different package source must not share a counter baseline")
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "different package source must prime")
+	writeIntelSysfsFile(t, hwmon, "energy3_input", "46000000")
+	setIntelSysfsTime(t, time.Unix(106, 0))
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Equal(t, 5.0, gm.GetCurrentData(1)["card0"].PowerPkg)
 }
 
 func TestIntelSysfsContinuityUsesOwnCacheAverage(t *testing.T) {
@@ -410,17 +378,19 @@ func TestIntelSysfsContinuityUsesOwnCacheAverage(t *testing.T) {
 }
 
 func TestIntelSysfsPackageExplicitLabelWins(t *testing.T) {
-	_, _, hwmon := setupIntelSysfsTest(t)
-	gm := &GPUManager{}
+	_, card, hwmon := setupIntelSysfsTest(t)
+	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy3_label", "pkg")
 	writeIntelSysfsFile(t, hwmon, "energy3_input", "1000000")
-	gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(100, 0))
+	setIntelSysfsTime(t, time.Unix(100, 0))
+	require.Equal(t, intelSysfsPriming, gm.sampleIntelSysfsGpuData(card, hwmon))
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "61000000")
 	writeIntelSysfsFile(t, hwmon, "energy3_input", "16000000")
-	watts, ok := gm.readIntelSysfsPowerPkg("card0", hwmon, time.Unix(103, 0))
-	require.True(t, ok)
-	require.Equal(t, 5.0, watts)
+	setIntelSysfsTime(t, time.Unix(103, 0))
+	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
+	require.Equal(t, 5.0, gm.GetCurrentData(1)["card0"].PowerPkg)
 }
 
 func TestIntelSysfsMultipleCards(t *testing.T) {
@@ -453,7 +423,7 @@ func TestIntelSysfsConcurrentConsumers(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range 100 {
-			gm.updateIntelSysfsGpuData(card, hwmon)
+			gm.sampleIntelSysfsGpuData(card, hwmon)
 		}
 	}()
 	for key := range uint16(4) {
@@ -472,25 +442,23 @@ func TestIntelSysfsHwmonReplacementReprimes(t *testing.T) {
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	setIntelSysfsTime(t, time.Unix(100, 0))
-	gm.updateIntelSysfsGpuData(card, hwmon)
+	gm.sampleIntelSysfsGpuData(card, hwmon)
 	newHwmon := filepath.Join(card, "device/hwmon/hwmon5")
 	require.NoError(t, os.Mkdir(newHwmon, 0755))
 	writeIntelSysfsFile(t, newHwmon, "energy1_input", "31000000")
 	setIntelSysfsTime(t, time.Unix(103, 0))
-	gm.updateIntelSysfsGpuData(card, newHwmon)
+	gm.sampleIntelSysfsGpuData(card, newHwmon)
 	require.Empty(t, gm.GetCurrentData(1))
 }
 
 func TestIntelSysfsOversizedNumericPrefixRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "number")
 	require.NoError(t, os.WriteFile(path, []byte("1"+strings.Repeat(" ", 100)+"corruption"), 0600))
-	_, err := readOptionalSysfsFloat(path)
-	require.Error(t, err)
-	_, err = readSysfsUint(path)
+	_, err := readSysfsUint(path)
 	require.Error(t, err)
 }
 
-// A FIFO deterministically holds an optional kernel-style sensor read open.
+// A FIFO deterministically holds a package-energy sensor read open.
 // Writer rendezvous proves the collector reached open/read, without sleep guesses.
 func blockedIntelCollector(t *testing.T) (*GPUManager, func()) {
 	t.Helper()
@@ -498,10 +466,10 @@ func blockedIntelCollector(t *testing.T) (*GPUManager, func()) {
 	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	gm := &GPUManager{GpuDataMap: map[string]*system.GPUData{"amd-card1": {Name: "AMD", Temperature: 50, Count: 1}}}
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	gm.intelSysfsEnergySnapshots["card0"] = intelSysfsEnergySnapshot{microjoules: 1000000, timestamp: time.Now().Add(-3 * time.Second)}
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
-	fifo := filepath.Join(hwmon, "temp1_input")
+	fifo := filepath.Join(hwmon, "energy2_input")
 	require.NoError(t, unix.Mkfifo(fifo, 0600))
 	require.True(t, gm.startIntelSysfsCollector())
 	fd := -1
@@ -608,27 +576,27 @@ func TestIntelSysfsDisappearRecreatePreservesName(t *testing.T) {
 
 func TestIntelSysfsFreshnessUsesEnergyObservation(t *testing.T) {
 	gm, release := blockedIntelCollector(t)
-	// The counter was observed before the optional sensor FIFO rendezvous.
+	// The counter was observed before the package energy FIFO rendezvous.
 	beforeRelease := time.Now()
 	release()
 	require.Eventually(t, func() bool { gm.Lock(); defer gm.Unlock(); return !gm.intelSysfsSamples["card0"].IsZero() }, time.Second, time.Millisecond)
 	gm.Lock()
 	observed := gm.intelSysfsSamples["card0"]
 	gm.Unlock()
-	require.True(t, observed.Before(beforeRelease), "optional reads must not extend energy freshness")
+	require.True(t, observed.Before(beforeRelease), "package reads must not extend energy freshness")
 }
 
 func TestIntelSysfsShutdownDoesNotVisitNextBlockedCard(t *testing.T) {
 	root, card, hwmon := setupIntelSysfsTest(t)
 	writeIntelSysfsFile(t, filepath.Join(card, "device"), "vendor", "0x8086")
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
-	first := filepath.Join(hwmon, "temp1_input")
+	first := filepath.Join(hwmon, "energy2_input")
 	require.NoError(t, unix.Mkfifo(first, 0600))
 	secondHwmon := filepath.Join(root, "card1/device/hwmon/hwmon1")
 	require.NoError(t, os.MkdirAll(secondHwmon, 0755))
 	writeIntelSysfsFile(t, filepath.Join(root, "card1/device"), "vendor", "0x8086")
 	writeIntelSysfsFile(t, secondHwmon, "energy1_input", "1000000")
-	second := filepath.Join(secondHwmon, "temp1_input")
+	second := filepath.Join(secondHwmon, "energy2_input")
 	require.NoError(t, unix.Mkfifo(second, 0600))
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	require.True(t, gm.startIntelSysfsCollector())
@@ -657,19 +625,19 @@ func TestIntelSysfsInvalidIntervalIsNotSuccessfulSampling(t *testing.T) {
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	setIntelSysfsTime(t, time.Unix(100, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon), "initial baseline is healthy priming")
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon), "initial baseline is healthy priming")
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000000000")
 	setIntelSysfsTime(t, time.Unix(103, 0))
-	require.False(t, gm.updateIntelSysfsGpuData(card, hwmon), "rejected spike is failed sampling")
+	require.Equal(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon), "rejected spike is failed sampling")
 	require.Empty(t, gm.GetCurrentData(1))
 	// A slow recovery probe must re-prime instead of remaining stuck in backoff.
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000003000000")
 	setIntelSysfsTime(t, time.Unix(163, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	require.Empty(t, gm.GetCurrentData(1))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000006000000")
 	setIntelSysfsTime(t, time.Unix(166, 0))
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	require.Equal(t, 1.0, gm.GetCurrentData(1)["card0"].Power)
 }
 
@@ -734,14 +702,14 @@ func TestIntelSysfsSlowPackageAcquisitionIsUnavailable(t *testing.T) {
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
 	writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
 	setIntelSysfsTime(t, time.Unix(100, 0))
-	gm.updateIntelSysfsGpuData(card, hwmon)
+	gm.sampleIntelSysfsGpuData(card, hwmon)
 	pkg := filepath.Join(hwmon, "energy2_input")
 	require.NoError(t, os.Remove(pkg))
 	require.NoError(t, unix.Mkfifo(pkg, 0600))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
 	setIntelSysfsTime(t, time.Unix(103, 0))
-	done := make(chan bool, 1)
-	go func() { done <- gm.updateIntelSysfsGpuData(card, hwmon) }()
+	done := make(chan intelSysfsSampleStatus, 1)
+	go func() { done <- gm.sampleIntelSysfsGpuData(card, hwmon) }()
 	fd := -1
 	require.Eventually(t, func() bool {
 		var err error
@@ -753,7 +721,7 @@ func TestIntelSysfsSlowPackageAcquisitionIsUnavailable(t *testing.T) {
 	_, err := unix.Write(fd, []byte("91000000"))
 	require.NoError(t, err)
 	require.NoError(t, unix.Close(fd))
-	require.True(t, <-done, "card interval remains valid")
+	require.Equal(t, intelSysfsMeasured, <-done, "card interval remains valid")
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "slow package acquisition must be unavailable, not a spike")
 }
 
@@ -766,7 +734,7 @@ func TestIntelSysfsPackageAvailabilityPerConsumer(t *testing.T) {
 		setIntelSysfsTime(t, time.Unix(int64(100+i*3), 0))
 		writeIntelSysfsFile(t, hwmon, "energy1_input", strconv.Itoa(1000000+i*90000000))
 		writeIntelSysfsFile(t, hwmon, "energy2_input", strconv.Itoa(1000000+i*48000000))
-		require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+		require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 		if i == 1 {
 			require.Equal(t, 16.0, gm.GetCurrentData(1)["card0"].PowerPkg)
 			require.Equal(t, 16.0, gm.GetCurrentData(60)["card0"].PowerPkg)
@@ -777,7 +745,7 @@ func TestIntelSysfsPackageAvailabilityPerConsumer(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(hwmon, "energy2_input")))
 	setIntelSysfsTime(t, time.Unix(109, 0))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "271000000")
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg, "realtime has consumed the earlier valid package sample")
 	require.Zero(t, gm.GetCurrentData(1)["card0"].PowerPkg)
 	historical := gm.GetCurrentData(60)
@@ -823,10 +791,10 @@ func TestIntelSysfsDisappearingHwmonRejectsSample(t *testing.T) {
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	setIntelSysfsTime(t, time.Unix(100, 0))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	setIntelSysfsTime(t, time.Unix(103, 0))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
-	fifo := filepath.Join(hwmon, "temp1_input")
+	fifo := filepath.Join(hwmon, "energy2_input")
 	require.NoError(t, unix.Mkfifo(fifo, 0600))
 	done := make(chan intelSysfsSampleStatus, 1)
 	go func() { done <- gm.sampleIntelSysfsGpuData(card, hwmon) }()
@@ -858,14 +826,14 @@ func TestIntelSysfsDisappearingHwmonRejectsSample(t *testing.T) {
 	require.Equal(t, 30.0, gm.GetCurrentData(1)["card0"].Power)
 }
 
-func TestIntelSysfsPrimaryFailureSkipsOptionalReads(t *testing.T) {
+func TestIntelSysfsPrimaryFailureSkipsPackageRead(t *testing.T) {
 	_, card, hwmon := setupIntelSysfsTest(t)
 	gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
 	setIntelSysfsTime(t, time.Unix(100, 0))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
-	require.True(t, gm.updateIntelSysfsGpuData(card, hwmon))
+	require.NotEqual(t, intelSysfsFailed, gm.sampleIntelSysfsGpuData(card, hwmon))
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "invalid")
-	fifo := filepath.Join(hwmon, "temp1_input")
+	fifo := filepath.Join(hwmon, "energy2_input")
 	require.NoError(t, unix.Mkfifo(fifo, 0600))
 	done := make(chan intelSysfsSampleStatus, 1)
 	go func() {
@@ -888,7 +856,7 @@ func TestIntelSysfsPrimaryFailureSkipsOptionalReads(t *testing.T) {
 					assert.NoError(t, unix.Close(fd))
 				}
 			case <-deadline.C:
-				t.Error("optional sensor worker did not exit during cleanup")
+				t.Error("package sensor worker did not exit during cleanup")
 				return
 			}
 		}
@@ -897,7 +865,7 @@ func TestIntelSysfsPrimaryFailureSkipsOptionalReads(t *testing.T) {
 	case status := <-done:
 		require.Equal(t, intelSysfsFailed, status)
 	case <-time.After(200 * time.Millisecond):
-		t.Fatal("primary energy failure accessed a blocking optional sensor")
+		t.Fatal("primary energy failure accessed a blocking package sensor")
 	}
 	require.NoError(t, os.Remove(fifo))
 	setIntelSysfsTime(t, time.Unix(103, 0))
@@ -908,4 +876,69 @@ func TestIntelSysfsPrimaryFailureSkipsOptionalReads(t *testing.T) {
 	writeIntelSysfsFile(t, hwmon, "energy1_input", "181000000")
 	require.Equal(t, intelSysfsMeasured, gm.sampleIntelSysfsGpuData(card, hwmon))
 	require.Equal(t, 30.0, gm.GetCurrentData(1)["card0"].Power)
+}
+
+// Unrelated sensor files must not be opened even if their kernel reads stall.
+// Power collection must still prime and deliver card/package measurements.
+func TestIntelSysfsIgnoresNonPowerAttributes(t *testing.T) {
+	for _, attribute := range []string{
+		"hwmon/temp1_input", "gpu_busy_percent",
+		"mem_info_vram_used", "mem_info_lmem_used", "mem_info_local_mem_used",
+		"mem_info_vram_total", "mem_info_lmem_total", "mem_info_local_mem_total",
+	} {
+		t.Run(attribute, func(t *testing.T) {
+			_, card, hwmon := setupIntelSysfsTest(t)
+			path := filepath.Join(card, "device", attribute)
+			if attribute == "hwmon/temp1_input" {
+				path = filepath.Join(hwmon, "temp1_input")
+			}
+			require.NoError(t, unix.Mkfifo(path, 0600))
+			gm := &GPUManager{GpuDataMap: make(map[string]*system.GPUData)}
+			sample := func() intelSysfsSampleStatus {
+				done := make(chan intelSysfsSampleStatus, 1)
+				go func() { done <- gm.sampleIntelSysfsGpuData(card, hwmon); close(done) }()
+				t.Cleanup(func() {
+					deadline := time.NewTimer(time.Second)
+					defer deadline.Stop()
+					tick := time.NewTicker(time.Millisecond)
+					defer tick.Stop()
+					for {
+						select {
+						case <-done:
+							return
+						case <-tick.C:
+							if fd, err := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+								assert.NoError(t, unix.Close(fd))
+							}
+						case <-deadline.C:
+							t.Error("released sensor reader did not exit")
+							return
+						}
+					}
+				})
+				select {
+				case status := <-done:
+					return status
+				case <-time.After(time.Second):
+					t.Fatal("power collector opened an unrelated sensor")
+					return intelSysfsFailed
+				}
+			}
+			setIntelSysfsTime(t, time.Unix(100, 0))
+			writeIntelSysfsFile(t, hwmon, "energy1_input", "1000000")
+			writeIntelSysfsFile(t, hwmon, "energy2_input", "1000000")
+			require.Equal(t, intelSysfsPriming, sample())
+			setIntelSysfsTime(t, time.Unix(103, 0))
+			writeIntelSysfsFile(t, hwmon, "energy1_input", "91000000")
+			writeIntelSysfsFile(t, hwmon, "energy2_input", "16000000")
+			require.Equal(t, intelSysfsMeasured, sample())
+			data := gm.GetCurrentData(1)["card0"]
+			require.Equal(t, 30.0, data.Power)
+			require.Equal(t, 5.0, data.PowerPkg)
+			require.Zero(t, data.Temperature)
+			require.Zero(t, data.Usage)
+			require.Zero(t, data.MemoryUsed)
+			require.Zero(t, data.MemoryTotal)
+		})
+	}
 }

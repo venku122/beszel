@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -218,21 +217,13 @@ func sysfsFileExists(path string) bool {
 	return err == nil && info.Mode().IsRegular() && unix.Faccessat(unix.AT_FDCWD, path, unix.R_OK, unix.AT_EACCESS) == nil
 }
 
-// updateIntelSysfsGpuData reads GPU metrics from sysfs and updates the GPU data map.
-// Returns true for initial/recovery priming or a valid measured interval.
-// Rejected intervals are failures; priming never emits measured zero.
-func (gm *GPUManager) updateIntelSysfsGpuData(cardPath, hwmonDir string) bool {
-	return gm.sampleIntelSysfsGpuData(cardPath, hwmonDir) != intelSysfsFailed
-}
-
 func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSysfsSampleStatus {
-	// All filesystem operations, including metadata and optional sensors, occur
+	// All filesystem operations, including metadata and power sensors, occur
 	// outside the manager lock. A kernel-stalled read must not freeze hub stats.
 	if gm.intelSysfsStopped() {
 		return intelSysfsFailed
 	}
 	started := time.Now()
-	devicePath := filepath.Join(cardPath, "device")
 	device := intelSysfsDevice(cardPath)
 	sensorPath, sensorErr := filepath.EvalSymlinks(hwmonDir)
 	if sensorErr != nil {
@@ -250,12 +241,6 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 	if pkgErr == nil {
 		pkgNow = intelSysfsNow()
 	}
-	temp := readIntelSysfsTemperature(hwmonDir)
-	usage, usageErr := readOptionalSysfsFloat(filepath.Join(devicePath, "gpu_busy_percent"))
-	memUsed, memUsedErr := readFirstOptionalSysfsFloat(
-		filepath.Join(devicePath, "mem_info_vram_used"), filepath.Join(devicePath, "mem_info_lmem_used"), filepath.Join(devicePath, "mem_info_local_mem_used"))
-	memTotal, memTotalErr := readFirstOptionalSysfsFloat(
-		filepath.Join(devicePath, "mem_info_vram_total"), filepath.Join(devicePath, "mem_info_lmem_total"), filepath.Join(devicePath, "mem_info_local_mem_total"))
 	// Reject a path reassigned during sampling. Revalidation also stays outside
 	// the mutex, and stopped collectors can never commit late sensor results.
 	if device != intelSysfsDevice(cardPath) {
@@ -312,19 +297,6 @@ func (gm *GPUManager) sampleIntelSysfsGpuData(cardPath, hwmonDir string) intelSy
 		gm.GpuDataMap[id] = gpu
 	}
 
-	gpu.Temperature, gpu.MemoryUsed, gpu.MemoryTotal = 0, 0, 0
-	if usageErr == nil && hasPower {
-		gpu.Usage += usage
-	}
-	if memUsedErr == nil {
-		gpu.MemoryUsed = utils.BytesToMegabytes(memUsed)
-	}
-	if memTotalErr == nil {
-		gpu.MemoryTotal = utils.BytesToMegabytes(memTotal)
-	}
-	if temp > 0 {
-		gpu.Temperature = temp
-	}
 	if hasPower {
 		gpu.Power += power
 		slog.Debug("Computed Intel sysfs GPU power", "card", id, "watts", power)
@@ -400,11 +372,6 @@ func (gm *GPUManager) calculateIntelSysfsPower(cardID string, microjoules uint64
 	return watts, true
 }
 
-func (gm *GPUManager) readIntelSysfsPowerPkg(cardID, hwmonDir string, timestamp time.Time) (float64, bool) {
-	selected, energy, err := readIntelSysfsPackageCounter(hwmonDir)
-	return gm.calculateIntelSysfsPackagePower(cardID, selected, energy, err, timestamp)
-}
-
 func readIntelSysfsPackageCounter(hwmonDir string) (string, uint64, error) {
 	energyPaths, _ := filepath.Glob(filepath.Join(hwmonDir, "energy*_input"))
 	selected, fallback := "", ""
@@ -451,17 +418,6 @@ func (gm *GPUManager) calculateIntelSysfsPackagePower(cardID, selected string, e
 	return gm.calculateIntelSysfsPower(key, energy, timestamp)
 }
 
-func readIntelSysfsTemperature(hwmonDir string) float64 {
-	tempPaths, _ := filepath.Glob(filepath.Join(hwmonDir, "temp*_input"))
-	for _, path := range tempPaths {
-		temp, err := readOptionalSysfsFloat(path)
-		if err == nil && temp > 0 {
-			return temp / 1000.0
-		}
-	}
-	return 0
-}
-
 func readSysfsUint(path string) (uint64, error) {
 	started := time.Now()
 	val, err := readIntelSysfsNumber(path)
@@ -475,31 +431,6 @@ func readSysfsUint(path string) (uint64, error) {
 		return 0, err
 	}
 	return strconv.ParseUint(strings.TrimSpace(val), 10, 64)
-}
-
-func readOptionalSysfsFloat(path string) (float64, error) {
-	val, err := readIntelSysfsNumber(path)
-	if err != nil {
-		return 0, err
-	}
-	number, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
-	if err != nil {
-		return 0, err
-	}
-	if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
-		return 0, fmt.Errorf("invalid sysfs number")
-	}
-	return number, nil
-}
-
-func readFirstOptionalSysfsFloat(paths ...string) (float64, error) {
-	for _, path := range paths {
-		val, err := readOptionalSysfsFloat(path)
-		if err == nil {
-			return val, nil
-		}
-	}
-	return 0, fmt.Errorf("no sysfs values found")
 }
 
 func getIntelSysfsGpuName(cardPath string) string {
